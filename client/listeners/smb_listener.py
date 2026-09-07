@@ -488,41 +488,68 @@ class SmbListener(BaseListener):
             self.pipe_name, ("127.0.0.1", tcp_port)
         )
 
-        # ── Monkey-patch handler for debug logging ──
+        # ── Monkey-patch: fix guest-session + signing conflict ──
+        # When no credentials are configured, impacket marks the
+        # session as "guest" (SessionFlags=0x01).  Domain-joined
+        # Windows with "Digitally sign communications (always)"
+        # MUST reject a guest session because it cannot derive a
+        # signing key.  The fix: after auth, clear the guest flag
+        # so the client treats it as a normal (unsigned) session.
         try:
             real_server = self._server.getServer()
-            if real_server is not None:
-                _OrigHandler = real_server.RequestHandlerClass
+            _orig_processRequest = real_server.processRequest
 
-                class _DebugHandler(_OrigHandler):
-                    def handle(self):
-                        log.debug(
-                            f"[DBG] SMB handler started for "
-                            f"{self.client_address}"
-                        )
-                        try:
-                            super().handle()
-                        except Exception as e:
-                            log.error(
-                                f"[!] SMB handler exception for "
-                                f"{self.client_address}: {e}",
-                                exc_info=True,
-                            )
+            def _patched_processRequest(connId, data):
+                results = _orig_processRequest(connId, data)
+                # Log every command for debugging
+                try:
+                    import impacket.smb2 as _smb2
+                    pkt = _smb2.SMB2Packet(data)
+                    cmd = pkt['Command']
+                    cmd_names = {
+                        0: "NEGOTIATE", 1: "SESSION_SETUP",
+                        3: "TREE_CONNECT", 5: "CREATE",
+                        8: "READ", 9: "WRITE",
+                        11: "IOCTL", 14: "FIND",
+                        16: "CLOSE", 4: "TREE_DISCONNECT",
+                    }
+                    log.debug(
+                        f"[DBG] SMB2 cmd={cmd_names.get(cmd, hex(cmd))} "
+                        f"from conn {connId}"
+                    )
+                except Exception:
+                    pass
+                return results
 
-                    def finish(self):
-                        log.debug(
-                            f"[DBG] SMB handler finished for "
-                            f"{self.client_address}"
-                        )
+            real_server.processRequest = _patched_processRequest
+
+            # Patch SMB2 Session Setup to clear guest flag
+            from impacket.smbserver import SMB2Commands
+            _orig_setup = SMB2Commands.smb2SessionSetup.__func__
+            @staticmethod
+            def _patched_sessionSetup(connId, smbServer, recvPacket):
+                result = _orig_setup(connId, smbServer, recvPacket)
+                # result = ([respSMBCommand, ...], None, errorCode)
+                if result and result[0]:
+                    for resp in result[0]:
                         try:
-                            super().finish()
+                            # Clear IS_GUEST (bit 0) and IS_NULL (bit 1)
+                            if hasattr(resp, 'fields') and 'SessionFlags' in resp.fields:
+                                old = resp['SessionFlags']
+                                resp['SessionFlags'] = old & ~0x03
+                                if old != resp['SessionFlags']:
+                                    log.info(
+                                        "[*] Cleared guest/null session flag "
+                                        f"(was 0x{old:04x})"
+                                    )
                         except Exception:
                             pass
+                return result
+            SMB2Commands.smb2SessionSetup = _patched_sessionSetup
 
-                real_server.RequestHandlerClass = _DebugHandler
-                log.debug("[*] Installed debug SMB handler wrapper")
+            log.debug("[*] Installed SMB2 session-setup and debug patches")
         except Exception as e:
-            log.debug(f"Could not install debug handler: {e}")
+            log.warning(f"Could not install SMB patches: {e}")
 
         # Start SMB server in a thread
         self._thread = threading.Thread(
