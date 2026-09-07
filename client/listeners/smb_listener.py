@@ -300,6 +300,8 @@ class PsProtocolHandler:
         session.arch = msg.get("a", "")
         session.os_version = msg.get("o", "")
         session.process_name = msg.get("n", "")
+        session.agent_version = msg.get("v", "1.0.0")
+        session.dotnet_version = msg.get("dn", "")
         session.update_last_seen()
 
         if is_new and session.hostname:
