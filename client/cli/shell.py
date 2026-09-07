@@ -130,6 +130,7 @@ class OperatorShell:
             pipe_name = opts.get("pipename", "msagent_01")
             host = opts.get("host", "0.0.0.0")
             name = opts.get("name", "SMB")
+            raw_port = int(opts.get("raw-port", 0))
             lid = self._next_listener_id()
 
             # Find RSA key from existing listeners or default path
@@ -153,6 +154,7 @@ class OperatorShell:
                 host=host,
                 rsa_private_key_path=rsa_path,
                 name=name,
+                raw_port=raw_port,
             )
             try:
                 await listener.start()
