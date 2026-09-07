@@ -488,68 +488,76 @@ class SmbListener(BaseListener):
             self.pipe_name, ("127.0.0.1", tcp_port)
         )
 
-        # ── Monkey-patch: fix guest-session + signing conflict ──
-        # When no credentials are configured, impacket marks the
-        # session as "guest" (SessionFlags=0x01).  Domain-joined
-        # Windows with "Digitally sign communications (always)"
-        # MUST reject a guest session because it cannot derive a
-        # signing key.  The fix: after auth, clear the guest flag
-        # so the client treats it as a normal (unsigned) session.
+        # ── Monkey-patch impacket for AD compatibility + debugging ──
+        #
+        # Problem: impacket marks sessions as "guest" (SessionFlags=1)
+        # when no server credentials are configured.  Per MS-SMB2 §3.2.5.3.1,
+        # a client that requires signing MUST reject guest sessions
+        # (STATUS_ACCESS_DENIED) — instant disconnect after auth.
+        #
+        # Fix: replace the Session Setup handler in the command dict
+        # so we clear the guest flag before the response is sent.
         try:
             real_server = self._server.getServer()
+            smb2_cmds = real_server._SMBSERVER__smb2Commands
+
+            # ── Wrap processRequest for command-level logging ──
+            from impacket import smb3 as _smb3_mod
             _orig_processRequest = real_server.processRequest
 
+            _cmd_names = {
+                0: "NEGOTIATE", 1: "SESSION_SETUP", 2: "LOGOFF",
+                3: "TREE_CONNECT", 4: "TREE_DISCONNECT",
+                5: "CREATE", 6: "CLOSE", 7: "FLUSH",
+                8: "READ", 9: "WRITE", 10: "LOCK",
+                11: "IOCTL", 12: "CANCEL", 13: "ECHO",
+                14: "QUERY_DIRECTORY", 15: "CHANGE_NOTIFY",
+                16: "QUERY_INFO", 17: "SET_INFO",
+            }
+
             def _patched_processRequest(connId, data):
-                results = _orig_processRequest(connId, data)
-                # Log every command for debugging
+                # Log inbound command
                 try:
-                    import impacket.smb2 as _smb2
-                    pkt = _smb2.SMB2Packet(data)
+                    pkt = _smb3_mod.SMB2Packet(data=data)
                     cmd = pkt['Command']
-                    cmd_names = {
-                        0: "NEGOTIATE", 1: "SESSION_SETUP",
-                        3: "TREE_CONNECT", 5: "CREATE",
-                        8: "READ", 9: "WRITE",
-                        11: "IOCTL", 14: "FIND",
-                        16: "CLOSE", 4: "TREE_DISCONNECT",
-                    }
-                    log.debug(
-                        f"[DBG] SMB2 cmd={cmd_names.get(cmd, hex(cmd))} "
-                        f"from conn {connId}"
+                    log.info(
+                        f"[SMB2] >> {_cmd_names.get(cmd, f'0x{cmd:04x}')} "
+                        f"from {connId}"
                     )
-                except Exception:
-                    pass
+                except Exception as exc:
+                    log.info(f"[SMB2] >> (parse failed: {exc})")
+                results = _orig_processRequest(connId, data)
                 return results
 
             real_server.processRequest = _patched_processRequest
 
-            # Patch SMB2 Session Setup to clear guest flag
-            from impacket.smbserver import SMB2Commands
-            _orig_setup = SMB2Commands.smb2SessionSetup.__func__
-            @staticmethod
-            def _patched_sessionSetup(connId, smbServer, recvPacket):
-                result = _orig_setup(connId, smbServer, recvPacket)
-                # result = ([respSMBCommand, ...], None, errorCode)
+            # ── Wrap Session Setup handler in the command dict ──
+            _orig_session_setup = smb2_cmds[1]  # SMB2_SESSION_SETUP
+
+            def _patched_session_setup(connId, smbServer, recvPacket):
+                result = _orig_session_setup(connId, smbServer, recvPacket)
+                # result = ([respSMBCommand, ...], respPackets, errorCode)
                 if result and result[0]:
                     for resp in result[0]:
                         try:
-                            # Clear IS_GUEST (bit 0) and IS_NULL (bit 1)
-                            if hasattr(resp, 'fields') and 'SessionFlags' in resp.fields:
+                            if hasattr(resp, 'fields') and \
+                               'SessionFlags' in resp.fields:
                                 old = resp['SessionFlags']
                                 resp['SessionFlags'] = old & ~0x03
                                 if old != resp['SessionFlags']:
                                     log.info(
-                                        "[*] Cleared guest/null session flag "
-                                        f"(was 0x{old:04x})"
+                                        "[*] Cleared guest/null session "
+                                        f"flag (was 0x{old:04x})"
                                     )
                         except Exception:
                             pass
                 return result
-            SMB2Commands.smb2SessionSetup = _patched_sessionSetup
 
-            log.debug("[*] Installed SMB2 session-setup and debug patches")
+            smb2_cmds[1] = _patched_session_setup
+
+            log.info("[*] Installed SMB2 patches (guest-flag fix + cmd log)")
         except Exception as e:
-            log.warning(f"Could not install SMB patches: {e}")
+            log.warning(f"Could not install SMB patches: {e}", exc_info=True)
 
         # Start SMB server in a thread
         self._thread = threading.Thread(
