@@ -10,6 +10,7 @@ Wire format on pipe: [4 bytes LE: length] [packet bytes]
 
 import asyncio
 import logging
+import socket
 import struct
 import threading
 from pathlib import Path
@@ -148,39 +149,40 @@ class SmbListener(BaseListener):
 
         self._server = None
         self._thread: Optional[threading.Thread] = None
+        self._tcp_server: Optional[socket.socket] = None
+        self._tcp_thread: Optional[threading.Thread] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
     async def start(self):
         self._loop = asyncio.get_event_loop()
 
-        # Create impacket SMB server
-        # IPC$ is created automatically by SimpleSMBServer
+        # ── Local TCP server for impacket pipe forwarding ──
+        # impacket's registerNamedPipe maps a pipe name to a TCP
+        # address. When an agent opens the pipe, impacket connects
+        # to this TCP server and forwards all pipe I/O through it.
+        self._tcp_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._tcp_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._tcp_server.bind(('127.0.0.1', 0))
+        self._tcp_server.listen(8)
+        tcp_port = self._tcp_server.getsockname()[1]
+
+        self._tcp_thread = threading.Thread(
+            target=self._tcp_accept_loop, daemon=True
+        )
+        self._tcp_thread.start()
+
+        # ── impacket SMB server ──
         self._server = smbserver.SimpleSMBServer(
             listenAddress=self.host,
             listenPort=445,
         )
 
-        # Register named pipe callback
-        listener_ref = self
-        handler_instances: dict[int, SmbPipeHandler] = {}
+        # Register named pipe → impacket forwards pipe I/O to our TCP handler
+        self._server.registerNamedPipe(
+            self.pipe_name, ('127.0.0.1', tcp_port)
+        )
 
-        # Custom pipe handler that processes our protocol
-        def pipe_incoming_data(conn_id: int, data: bytes) -> Optional[bytes]:
-            if conn_id not in handler_instances:
-                handler_instances[conn_id] = SmbPipeHandler(listener_ref)
-
-            handler = handler_instances[conn_id]
-            packet = handler.read_framed(data)
-            if packet is None:
-                return None  # Still accumulating
-
-            response = handler.handle_packet(packet)
-            if response is None:
-                return b""
-
-            return handler.frame_response(response)
-
-        # Start server in a thread
+        # Start SMB server in a thread
         self._thread = threading.Thread(
             target=self._run_server, daemon=True
         )
@@ -198,13 +200,59 @@ class SmbListener(BaseListener):
             log.error(f"SMB server error: {e}")
             self.running = False
 
+    def _tcp_accept_loop(self):
+        """Accept TCP connections from impacket's pipe forwarder."""
+        while True:
+            try:
+                conn, _ = self._tcp_server.accept()
+                log.debug("Pipe TCP connection from impacket forwarder")
+                t = threading.Thread(
+                    target=self._tcp_pipe_handler,
+                    args=(conn,),
+                    daemon=True,
+                )
+                t.start()
+            except OSError:
+                break  # Socket closed in stop()
+
+    def _tcp_pipe_handler(self, conn: socket.socket):
+        """Handle pipe I/O forwarded from impacket for one agent session."""
+        handler = SmbPipeHandler(self)
+        conn.settimeout(300)  # 5 min idle timeout
+        try:
+            while True:
+                data = conn.recv(65536)
+                if not data:
+                    break
+
+                # Feed data; process every complete frame in the buffer
+                packet = handler.read_framed(data)
+                while packet is not None:
+                    response = handler.handle_packet(packet)
+                    if response is not None:
+                        framed = handler.frame_response(response)
+                        conn.sendall(framed)
+                    # Check for another complete frame already buffered
+                    packet = handler.read_framed(b"")
+        except socket.timeout:
+            log.debug("SMB pipe handler idle timeout")
+        except (ConnectionError, OSError) as e:
+            log.debug(f"SMB pipe handler closed: {e}")
+        finally:
+            conn.close()
+
     async def stop(self):
+        self.running = False
+        if self._tcp_server:
+            try:
+                self._tcp_server.close()
+            except Exception:
+                pass
         if self._server:
             try:
                 self._server.stop()
             except Exception:
                 pass
-        self.running = False
         log.info(f"[*] SMB listener stopped (pipe: {self.pipe_name})")
 
     def info(self) -> dict:
