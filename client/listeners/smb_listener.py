@@ -375,7 +375,7 @@ class PsProtocolHandler:
             if task.arguments:
                 args = task.arguments.decode("utf-8", errors="replace")
             td.append({
-                "i": task.task_id.replace("-", ""),
+                "i": task.task_id,
                 "c": task.module_name or "shell",
                 "a": args,
             })
