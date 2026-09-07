@@ -478,10 +478,51 @@ class SmbListener(BaseListener):
             listenPort=445,
         )
 
+        # Enable SMB2/3 — modern Windows (especially domain-joined)
+        # often has SMB1 disabled, so without this they just close
+        # the connection after negotiate.
+        self._server.setSMB2Support(True)
+
         # Register named pipe → impacket forwards pipe I/O to our TCP handler
         self._server.registerNamedPipe(
             self.pipe_name, ("127.0.0.1", tcp_port)
         )
+
+        # ── Monkey-patch handler for debug logging ──
+        try:
+            real_server = self._server.getServer()
+            if real_server is not None:
+                _OrigHandler = real_server.RequestHandlerClass
+
+                class _DebugHandler(_OrigHandler):
+                    def handle(self):
+                        log.debug(
+                            f"[DBG] SMB handler started for "
+                            f"{self.client_address}"
+                        )
+                        try:
+                            super().handle()
+                        except Exception as e:
+                            log.error(
+                                f"[!] SMB handler exception for "
+                                f"{self.client_address}: {e}",
+                                exc_info=True,
+                            )
+
+                    def finish(self):
+                        log.debug(
+                            f"[DBG] SMB handler finished for "
+                            f"{self.client_address}"
+                        )
+                        try:
+                            super().finish()
+                        except Exception:
+                            pass
+
+                real_server.RequestHandlerClass = _DebugHandler
+                log.debug("[*] Installed debug SMB handler wrapper")
+        except Exception as e:
+            log.debug(f"Could not install debug handler: {e}")
 
         # Start SMB server in a thread
         self._thread = threading.Thread(
@@ -491,7 +532,7 @@ class SmbListener(BaseListener):
         self.running = True
         log.info(
             f"[*] SMB listener started on {self.host} "
-            f"(pipe: {self.pipe_name})"
+            f"(pipe: {self.pipe_name}) [SMB2 enabled]"
         )
 
     def _run_server(self):
