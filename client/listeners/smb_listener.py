@@ -403,10 +403,12 @@ class SmbListener(BaseListener):
         magic: int = DEFAULT_MAGIC,
         name: str = "",
         ps_keys_dir: Optional[Path] = None,
+        raw_port: int = 0,
     ):
         super().__init__(listener_id, "SMB", name=name or "SMB")
         self.pipe_name = pipe_name
         self.host = host
+        self.raw_port = raw_port  # Optional raw-TCP port for direct agent connections
         self.session_manager = session_manager
         self.task_manager = task_manager
         self.logger = logger
@@ -424,6 +426,8 @@ class SmbListener(BaseListener):
         self._thread: Optional[threading.Thread] = None
         self._tcp_server: Optional[socket.socket] = None
         self._tcp_thread: Optional[threading.Thread] = None
+        self._raw_tcp_server: Optional[socket.socket] = None
+        self._raw_tcp_thread: Optional[threading.Thread] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
     # ── PSK management ────────────────────────────────────────────────
@@ -559,15 +563,40 @@ class SmbListener(BaseListener):
         except Exception as e:
             log.warning(f"Could not install SMB patches: {e}", exc_info=True)
 
+        # ── Optional raw-TCP port for direct agent connections ──
+        # Bypasses the SMB stack entirely — agents connect via TcpClient
+        # and speak the same framed PSK/AES protocol over plain TCP.
+        if self.raw_port:
+            self._raw_tcp_server = socket.socket(
+                socket.AF_INET, socket.SOCK_STREAM
+            )
+            self._raw_tcp_server.setsockopt(
+                socket.SOL_SOCKET, socket.SO_REUSEADDR, 1
+            )
+            self._raw_tcp_server.bind((self.host, self.raw_port))
+            self._raw_tcp_server.listen(8)
+            self._raw_tcp_thread = threading.Thread(
+                target=self._raw_tcp_accept_loop, daemon=True
+            )
+            self._raw_tcp_thread.start()
+            log.info(
+                f"[*] Raw TCP port {self.raw_port} open for "
+                f"direct agent connections"
+            )
+
         # Start SMB server in a thread
         self._thread = threading.Thread(
             target=self._run_server, daemon=True
         )
         self._thread.start()
         self.running = True
+
+        ports = f"pipe:{self.pipe_name}"
+        if self.raw_port:
+            ports += f", tcp:{self.raw_port}"
         log.info(
             f"[*] SMB listener started on {self.host} "
-            f"(pipe: {self.pipe_name}) [SMB2 enabled]"
+            f"({ports}) [SMB2 enabled]"
         )
 
     def _run_server(self):
@@ -579,6 +608,11 @@ class SmbListener(BaseListener):
 
     async def stop(self):
         self.running = False
+        if self._raw_tcp_server:
+            try:
+                self._raw_tcp_server.close()
+            except Exception:
+                pass
         if self._tcp_server:
             try:
                 self._tcp_server.close()
@@ -592,12 +626,15 @@ class SmbListener(BaseListener):
         log.info(f"[*] SMB listener stopped (pipe: {self.pipe_name})")
 
     def info(self) -> dict:
+        port_info = f"pipe:{self.pipe_name}"
+        if self.raw_port:
+            port_info += f", tcp:{self.raw_port}"
         return {
             "id": self.listener_id,
             "name": self.name,
             "type": self.listener_type,
             "interface": self.host,
-            "port": f"pipe:{self.pipe_name}",
+            "port": port_info,
             "status": "RUNNING" if self.running else "STOPPED",
         }
 
@@ -617,6 +654,21 @@ class SmbListener(BaseListener):
                 t.start()
             except OSError:
                 break  # Socket closed in stop()
+
+    def _raw_tcp_accept_loop(self):
+        """Accept direct TCP connections from agents (no SMB)."""
+        while True:
+            try:
+                conn, addr = self._raw_tcp_server.accept()
+                log.info(f"[*] Raw TCP agent connection from {addr[0]}:{addr[1]}")
+                t = threading.Thread(
+                    target=self._tcp_pipe_handler,
+                    args=(conn,),
+                    daemon=True,
+                )
+                t.start()
+            except OSError:
+                break
 
     def _tcp_pipe_handler(self, conn: socket.socket):
         """Handle pipe I/O for one agent session.
